@@ -1,20 +1,31 @@
 #!/usr/bin/env python3
 """Generate a Caddyfile from routes.json.
 
-routes.json is a list of routes:
+routes.json is a list of projects, each with a list of path routes:
 
     [
-        {"path": "/flowlet/api/*", "port": 8000},
-        {"path": "/flowlet/*",     "port": 3000}
+        {
+            "projectName": "Flowlet",
+            "launchScript": "$HOME/Flowlet/scripts/launch.sh",
+            "paths": [
+                {"path": "/api/*", "port": 8000},
+                {"path": "/*",     "port": 3000}
+            ]
+        }
     ]
 
-Each route forwards requests matching `path` to 127.0.0.1:<port>.
+Each path entry forwards requests matching `path` to 127.0.0.1:<port>.
 A path ending in "/*" also covers the bare prefix: "/flowlet" is
 308-redirected to "/flowlet/", so a trailing slash is never required
 (and backends that only serve the slashed path still work). The
 redirect is skipped if an explicit "/flowlet" route exists.
 
-Optional per-route keys:
+"launchScript" is not used here — it is read by scripts/panel.py, the
+control panel served at /default that can start/stop projects. The
+/default prefix is reserved: a route for it (to the panel's port,
+$PANEL_PORT or 8090) is injected automatically.
+
+Optional per-path keys:
     "strip": true   — strip the matched prefix before forwarding
                       (Caddy `handle_path`). Default false: the backend
                       receives the full original path (Caddy `handle`),
@@ -25,7 +36,7 @@ Routes are emitted longest-path-first so more specific paths win
 unless a route already covers everything (path "/*" or "/").
 
 Usage:
-    generate-caddyfile.py [routes.json] [-o Caddyfile] [--listen 8080]
+    generate-caddyfile.py [routes.json] [-o Caddyfile] [--listen 8080] [--panel-port 8090]
 """
 
 import argparse
@@ -35,6 +46,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+PANEL_PATH = "/default"
 
 
 def fail(msg):
@@ -44,43 +56,74 @@ def fail(msg):
 
 def load_routes(config_path):
     try:
-        routes = json.loads(Path(config_path).read_text())
+        projects = json.loads(Path(config_path).read_text())
     except FileNotFoundError:
         fail(f"config not found: {config_path}")
     except json.JSONDecodeError as e:
         fail(f"invalid JSON in {config_path}: {e}")
 
-    if not isinstance(routes, list) or not routes:
-        fail("config must be a non-empty JSON array of routes")
+    if not isinstance(projects, list) or not projects:
+        fail("config must be a non-empty JSON array of projects")
 
-    seen = set()
-    for i, route in enumerate(routes):
-        where = f"route #{i + 1}"
-        if not isinstance(route, dict):
+    routes = []
+    seen_paths, seen_names = set(), set()
+    for i, project in enumerate(projects):
+        where = f"project #{i + 1}"
+        if not isinstance(project, dict):
             fail(f"{where}: must be an object")
 
-        unknown = set(route) - {"path", "port", "strip"}
+        unknown = set(project) - {"projectName", "launchScript", "paths"}
         if unknown:
             fail(f"{where}: unknown keys: {', '.join(sorted(unknown))}")
 
-        path = route.get("path")
-        if not isinstance(path, str) or not path.startswith("/"):
-            fail(f"{where}: \"path\" must be a string starting with '/'")
-        if path in seen:
-            fail(f"{where}: duplicate path {path!r}")
-        seen.add(path)
+        name = project.get("projectName")
+        if not isinstance(name, str) or not name.strip():
+            fail(f"{where}: \"projectName\" must be a non-empty string")
+        if name in seen_names:
+            fail(f"{where}: duplicate projectName {name!r}")
+        seen_names.add(name)
+        where = f"project {name!r}"
 
-        port = route.get("port")
-        if not isinstance(port, int) or not 1 <= port <= 65535:
-            fail(f"{where} ({path}): \"port\" must be an integer in 1-65535")
+        launch = project.get("launchScript")
+        if launch is not None and (not isinstance(launch, str) or not launch.strip()):
+            fail(f"{where}: \"launchScript\" must be a non-empty string")
 
-        if not isinstance(route.get("strip", False), bool):
-            fail(f"{where} ({path}): \"strip\" must be true or false")
+        paths = project.get("paths")
+        if not isinstance(paths, list) or not paths:
+            fail(f"{where}: \"paths\" must be a non-empty array")
+
+        for j, route in enumerate(paths):
+            rwhere = f"{where}, path #{j + 1}"
+            if not isinstance(route, dict):
+                fail(f"{rwhere}: must be an object")
+
+            unknown = set(route) - {"path", "port", "strip"}
+            if unknown:
+                fail(f"{rwhere}: unknown keys: {', '.join(sorted(unknown))}")
+
+            path = route.get("path")
+            if not isinstance(path, str) or not path.startswith("/"):
+                fail(f"{rwhere}: \"path\" must be a string starting with '/'")
+            if path in seen_paths:
+                fail(f"{rwhere}: duplicate path {path!r}")
+            seen_paths.add(path)
+            if path.rstrip("*").rstrip("/") == PANEL_PATH or path.startswith(PANEL_PATH + "/"):
+                fail(f"{rwhere}: {PANEL_PATH} is reserved for the control panel")
+
+            port = route.get("port")
+            if not isinstance(port, int) or not 1 <= port <= 65535:
+                fail(f"{rwhere} ({path}): \"port\" must be an integer in 1-65535")
+
+            if not isinstance(route.get("strip", False), bool):
+                fail(f"{rwhere} ({path}): \"strip\" must be true or false")
+
+            routes.append(route)
 
     return routes
 
 
-def render(routes, listen_port):
+def render(routes, listen_port, panel_port):
+    routes = routes + [{"path": PANEL_PATH + "/*", "port": panel_port}]
     routes = sorted(routes, key=lambda r: len(r["path"]), reverse=True)
     has_catch_all = any(r["path"] in ("/", "/*") for r in routes)
 
@@ -128,9 +171,13 @@ def main():
     parser.add_argument("--listen", type=int,
                         default=int(os.environ.get("PROXY_PORT", "8080")),
                         help="port Caddy listens on (default: $PROXY_PORT or 8080)")
+    parser.add_argument("--panel-port", type=int,
+                        default=int(os.environ.get("PANEL_PORT", "8090")),
+                        help="port the /default control panel listens on "
+                             "(default: $PANEL_PORT or 8090)")
     args = parser.parse_args()
 
-    caddyfile = render(load_routes(args.config), args.listen)
+    caddyfile = render(load_routes(args.config), args.listen, args.panel_port)
     if args.output == "-":
         sys.stdout.write(caddyfile)
     else:

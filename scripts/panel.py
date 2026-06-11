@@ -1,0 +1,508 @@
+#!/usr/bin/env python3
+"""Control panel for the projects in routes.json, served at /default.
+
+Shows, per project, whether each of its ports is listening, and offers
+start/stop for projects that define a "launchScript":
+
+  start — runs the script via `bash -lc`, detached in its own process
+          group; output is captured to ~/.local/state/routing-panel/logs/
+  stop  — SIGTERMs every process group found listening on the project's
+          ports (plus the group we launched, if any), SIGKILL after 5s.
+
+Processes are found by matching listening-socket inodes from
+/proc/net/tcp[6] against /proc/<pid>/fd, which only works for
+same-user processes — fine here, since the panel and the dev servers
+run as the same user.
+
+API (the /default prefix is optional when hitting the port directly):
+  GET  /default/                          dashboard (HTML)
+  GET  /default/api/projects              status JSON
+  GET  /default/api/projects/<name>/log   captured launch output (tail)
+  POST /default/api/projects/<name>/start
+  POST /default/api/projects/<name>/stop
+
+Env:
+  PANEL_PORT     listen port (default 8090)
+  PANEL_BIND     bind address (default 127.0.0.1 — Caddy proxies to us)
+  PANEL_TOKEN    if set, API requests must send an X-Panel-Token header.
+                 Set this if the proxy is exposed via Funnel: otherwise
+                 anyone on the internet can start/stop your projects.
+  ROUTES_CONFIG  path to routes.json (default: repo root)
+"""
+
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import unquote, urlparse
+
+ROOT = Path(__file__).resolve().parent.parent
+CONFIG = Path(os.environ.get("ROUTES_CONFIG", str(ROOT / "routes.json")))
+PORT = int(os.environ.get("PANEL_PORT", "8090"))
+BIND = os.environ.get("PANEL_BIND", "127.0.0.1")
+TOKEN = os.environ.get("PANEL_TOKEN", "")
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME",
+                                str(Path.home() / ".local/state"))) / "routing-panel"
+LOG_DIR = STATE_DIR / "logs"
+PGID_FILE = STATE_DIR / "pgids.json"
+
+lock = threading.Lock()
+pgids = {}  # projectName -> pgid of the process group we launched
+
+
+class PanelError(Exception):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+def load_projects():
+    projects = json.loads(CONFIG.read_text())
+    if not isinstance(projects, list):
+        raise ValueError("routes.json must be a JSON array of projects")
+    return projects
+
+
+def find_project(name):
+    for project in load_projects():
+        if project.get("projectName") == name:
+            return project
+    raise PanelError(404, f"unknown project: {name}")
+
+
+def project_ports(project):
+    ports = []
+    for route in project.get("paths", []):
+        if route.get("port") not in ports:
+            ports.append(route["port"])
+    return ports
+
+
+def slug(name):
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", name)
+
+
+def listen_inodes():
+    """Map of port -> socket inodes for every LISTEN tcp/tcp6 socket."""
+    by_port = {}
+    for proc_file in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            lines = Path(proc_file).read_text().splitlines()[1:]
+        except OSError:
+            continue
+        for line in lines:
+            fields = line.split()
+            if len(fields) < 10 or fields[3] != "0A":  # 0A = LISTEN
+                continue
+            port = int(fields[1].rsplit(":", 1)[1], 16)
+            by_port.setdefault(port, set()).add(fields[9])
+    return by_port
+
+
+def pids_for_inodes(inodes):
+    """Same-user pids holding any of the given socket inodes."""
+    targets = {f"socket:[{inode}]" for inode in inodes}
+    pids = set()
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        fd_dir = f"/proc/{entry}/fd"
+        try:
+            fds = os.listdir(fd_dir)
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                if os.readlink(f"{fd_dir}/{fd}") in targets:
+                    pids.add(int(entry))
+                    break
+            except OSError:
+                continue
+    return pids
+
+
+def group_alive(pgid):
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def load_pgids():
+    global pgids
+    try:
+        pgids = {k: v for k, v in json.loads(PGID_FILE.read_text()).items()
+                 if group_alive(v)}
+    except (OSError, ValueError):
+        pgids = {}
+
+
+def save_pgids():
+    PGID_FILE.write_text(json.dumps(pgids))
+
+
+def project_status():
+    by_port = listen_inodes()
+    out = []
+    for project in load_projects():
+        name = project.get("projectName", "?")
+        ports = [{"path": r.get("path"), "port": r.get("port"),
+                  "listening": r.get("port") in by_port}
+                 for r in project.get("paths", [])]
+        uniq = {p["port"]: p["listening"] for p in ports}
+        up = sum(1 for listening in uniq.values() if listening)
+        state = ("running" if uniq and up == len(uniq)
+                 else "stopped" if up == 0 else "partial")
+        with lock:
+            managed = name in pgids and group_alive(pgids[name])
+        out.append({
+            "projectName": name,
+            "canLaunch": bool(project.get("launchScript")),
+            "managed": managed,
+            "ports": ports,
+            "state": state,
+        })
+    return out
+
+
+def start_project(project):
+    name = project["projectName"]
+    script = project.get("launchScript")
+    if not script:
+        raise PanelError(400, f"{name} has no launchScript configured")
+
+    by_port = listen_inodes()
+    ports = project_ports(project)
+    if ports and all(port in by_port for port in ports):
+        raise PanelError(409, f"{name} is already running")
+
+    log_file = LOG_DIR / f"{slug(name)}.log"
+    with open(log_file, "ab") as log:
+        log.write(f"\n--- start {time.strftime('%F %T')}: {script}\n".encode())
+        proc = subprocess.Popen(
+            ["bash", "-lc", script],
+            cwd=str(Path.home()),
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,  # own process group, survives the panel
+        )
+    with lock:
+        pgids[name] = proc.pid
+        save_pgids()
+    threading.Thread(target=proc.wait, daemon=True).start()  # reap on exit
+    return {"ok": True, "pid": proc.pid}
+
+
+def stop_project(project):
+    name = project["projectName"]
+    by_port = listen_inodes()
+    inodes = set()
+    for port in project_ports(project):
+        inodes |= by_port.get(port, set())
+    pids = pids_for_inodes(inodes)
+
+    groups = set()
+    for pid in pids:
+        try:
+            groups.add(os.getpgid(pid))
+        except ProcessLookupError:
+            pass
+    with lock:
+        saved = pgids.pop(name, None)
+        save_pgids()
+    if saved and group_alive(saved):
+        groups.add(saved)
+    groups.discard(os.getpgid(0))  # never kill ourselves
+
+    if not groups:
+        if inodes:
+            raise PanelError(409, f"{name}'s ports are held by a process this "
+                                  "panel cannot signal (owned by another user?)")
+        return {"ok": True, "detail": "nothing was running"}
+
+    for pgid in groups:
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    def escalate(targets):
+        time.sleep(5)
+        for pgid in targets:
+            if group_alive(pgid):
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+
+    threading.Thread(target=escalate, args=(set(groups),), daemon=True).start()
+    return {"ok": True, "signalled": sorted(groups)}
+
+
+def log_tail(name, max_bytes=16384):
+    log_file = LOG_DIR / f"{slug(name)}.log"
+    try:
+        with open(log_file, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - max_bytes))
+            return f.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>routing — projects</title>
+<style>
+:root{--bg:#0f1115;--card:#181b22;--line:#262b35;--text:#e6e9ef;--dim:#8b93a3;
+      --green:#3fb950;--red:#f85149;--amber:#d29922;--accent:#4493f8}
+*{box-sizing:border-box}
+body{margin:0;font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;
+     background:var(--bg);color:var(--text)}
+header{display:flex;align-items:baseline;gap:12px;padding:24px 28px 4px}
+h1{font-size:20px;margin:0}
+#updated{margin-left:auto;color:var(--dim);font-size:12px}
+#err{color:var(--red);font-size:13px;padding:0 28px;min-height:20px}
+main{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));
+     gap:16px;padding:8px 28px 40px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;
+      padding:16px 18px}
+.head{display:flex;align-items:center;gap:10px;margin-bottom:8px}
+.head h2{font-size:16px;margin:0}
+.badge{margin-left:auto;font-size:12px;padding:2px 10px;border-radius:999px;
+       border:1px solid var(--line);color:var(--dim)}
+.badge.running{color:var(--green);border-color:var(--green)}
+.badge.partial{color:var(--amber);border-color:var(--amber)}
+table{width:100%;border-collapse:collapse;font-size:13px;margin:6px 0 12px}
+td{padding:3px 0;color:var(--dim)}
+td.mono{text-align:right;font-family:ui-monospace,SFMono-Regular,monospace}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;
+     background:var(--line);margin-right:8px}
+.dot.on{background:var(--green)}
+.on-text{color:var(--green)}
+.actions{display:flex;gap:8px}
+button{font:inherit;font-size:13px;padding:5px 14px;border-radius:6px;
+       border:1px solid var(--line);background:#212630;color:var(--text);
+       cursor:pointer}
+button:hover:enabled{border-color:var(--accent)}
+button.stop:hover:enabled{border-color:var(--red);color:var(--red)}
+button:disabled{opacity:.45;cursor:default}
+details{margin-top:12px;font-size:12px}
+summary{color:var(--dim);cursor:pointer;user-select:none}
+pre{background:#0b0d11;border:1px solid var(--line);border-radius:6px;
+    padding:8px 10px;max-height:240px;overflow:auto;white-space:pre-wrap;
+    font-size:11px}
+</style>
+</head>
+<body>
+<header><h1>Projects</h1><span id="updated"></span></header>
+<div id="err"></div>
+<main id="grid"></main>
+<script>
+const TKEY = 'routing-panel-token';
+const busy = new Set();
+const openLogs = new Set();
+let last = [];
+
+function authHeaders() {
+  const t = localStorage.getItem(TKEY);
+  return t ? {'X-Panel-Token': t} : {};
+}
+
+async function api(path, opts = {}) {
+  let r = await fetch(path, {...opts, headers: {...authHeaders(), ...(opts.headers || {})}});
+  if (r.status === 401) {
+    const t = prompt('This panel requires a token (PANEL_TOKEN):');
+    if (t) {
+      localStorage.setItem(TKEY, t);
+      r = await fetch(path, {...opts, headers: {...authHeaders(), ...(opts.headers || {})}});
+    }
+  }
+  return r;
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+}
+
+function showErr(msg) { document.getElementById('err').textContent = msg; }
+
+async function act(name, what) {
+  busy.add(name);
+  render(last);
+  try {
+    const r = await api('api/projects/' + encodeURIComponent(name) + '/' + what, {method: 'POST'});
+    const d = await r.json().catch(() => ({}));
+    showErr(r.ok ? '' : (d.error || (what + ' failed (' + r.status + ')')));
+  } catch (e) {
+    showErr(String(e));
+  }
+  // give the process a moment to bind/release its ports before re-polling
+  setTimeout(() => { busy.delete(name); refresh(); }, what === 'start' ? 1500 : 800);
+}
+
+async function loadLog(name, card) {
+  const r = await api('api/projects/' + encodeURIComponent(name) + '/log');
+  if (r && r.ok) {
+    const pre = card.querySelector('pre');
+    pre.textContent = (await r.text()) || '(no output captured yet)';
+    pre.scrollTop = pre.scrollHeight;
+  }
+}
+
+function render(projects) {
+  last = projects;
+  const grid = document.getElementById('grid');
+  grid.innerHTML = '';
+  for (const p of projects) {
+    const card = document.createElement('div');
+    card.className = 'card';
+    const rows = p.ports.map(pt =>
+      '<tr><td><span class="dot ' + (pt.listening ? 'on' : '') + '"></span>' + esc(pt.path) + '</td>' +
+      '<td class="mono">:' + pt.port + '</td>' +
+      '<td class="mono">' + (pt.listening ? '<span class="on-text">listening</span>' : 'down') + '</td></tr>'
+    ).join('');
+    const isBusy = busy.has(p.projectName);
+    const startOff = !p.canLaunch || p.state === 'running' || isBusy;
+    const stopOff = (p.state === 'stopped' && !p.managed) || isBusy;
+    card.innerHTML =
+      '<div class="head"><h2>' + esc(p.projectName) + '</h2>' +
+      '<span class="badge ' + p.state + '">' + (isBusy ? 'working…' : p.state) + '</span></div>' +
+      '<table>' + rows + '</table>' +
+      '<div class="actions">' +
+      '<button class="start"' + (startOff ? ' disabled' : '') +
+      (p.canLaunch ? '' : ' title="no launchScript configured"') + '>Start</button>' +
+      '<button class="stop"' + (stopOff ? ' disabled' : '') + '>Stop</button>' +
+      '</div>' +
+      '<details' + (openLogs.has(p.projectName) ? ' open' : '') +
+      '><summary>launch log</summary><pre>…</pre></details>';
+    card.querySelector('.start').onclick = () => act(p.projectName, 'start');
+    card.querySelector('.stop').onclick = () => act(p.projectName, 'stop');
+    const det = card.querySelector('details');
+    det.addEventListener('toggle', () => {
+      det.open ? openLogs.add(p.projectName) : openLogs.delete(p.projectName);
+      if (det.open) loadLog(p.projectName, card);
+    });
+    if (det.open) loadLog(p.projectName, card);
+    grid.appendChild(card);
+  }
+}
+
+async function refresh() {
+  try {
+    const r = await api('api/projects');
+    if (!r.ok) { showErr('status fetch failed (' + r.status + ')'); return; }
+    render(await r.json());
+    document.getElementById('updated').textContent =
+      'updated ' + new Date().toLocaleTimeString();
+    showErr('');
+  } catch (e) {
+    showErr('panel unreachable: ' + e);
+  }
+}
+
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>
+"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "routing-panel"
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
+
+    def _send(self, code, body, ctype="application/json"):
+        data = body if isinstance(body, bytes) else json.dumps(body).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _path(self):
+        path = urlparse(self.path).path
+        if path == "/default":  # relative URLs in the page need the slash
+            self.send_response(308)
+            self.send_header("Location", "/default/")
+            self.end_headers()
+            return None
+        if path.startswith("/default/"):
+            path = path[len("/default"):]
+        return path
+
+    def _authed(self):
+        return not TOKEN or self.headers.get("X-Panel-Token") == TOKEN
+
+    def _dispatch(self, path, method):
+        if not self._authed():
+            return self._send(401, {"error": "missing or bad X-Panel-Token"})
+        try:
+            if method == "GET" and path == "/api/projects":
+                return self._send(200, project_status())
+            m = re.fullmatch(r"/api/projects/([^/]+)/(log|start|stop)", path)
+            if m:
+                name, action = unquote(m.group(1)), m.group(2)
+                if method == "GET" and action == "log":
+                    find_project(name)  # 404 for unknown names
+                    return self._send(200, log_tail(name).encode(),
+                                      "text/plain; charset=utf-8")
+                if method == "POST" and action == "start":
+                    return self._send(200, start_project(find_project(name)))
+                if method == "POST" and action == "stop":
+                    return self._send(200, stop_project(find_project(name)))
+            self._send(404, {"error": "not found"})
+        except PanelError as e:
+            self._send(e.code, {"error": str(e)})
+        except Exception as e:  # bad routes.json, etc.
+            self._send(500, {"error": f"{type(e).__name__}: {e}"})
+
+    def do_GET(self):
+        path = self._path()
+        if path is None:
+            return
+        if path in ("/", "/index.html"):
+            return self._send(200, PAGE.encode(), "text/html; charset=utf-8")
+        if path == "/favicon.ico":
+            return self._send(404, b"", "text/plain")
+        self._dispatch(path, "GET")
+
+    def do_POST(self):
+        path = self._path()
+        if path is None:
+            return
+        self._dispatch(path, "POST")
+
+
+def main():
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(exist_ok=True)
+    load_pgids()
+    if not TOKEN and BIND not in ("127.0.0.1", "::1", "localhost"):
+        print("warning: PANEL_TOKEN is not set and the panel is not bound to "
+              "localhost — anyone who can reach it can start/stop projects",
+              file=sys.stderr)
+    server = ThreadingHTTPServer((BIND, PORT), Handler)
+    print(f"routing panel on http://{BIND}:{PORT}/default  (config: {CONFIG})")
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

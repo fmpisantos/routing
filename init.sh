@@ -72,5 +72,6 @@ chmod +x "$ROOT"/scripts/*.sh
 echo
 ok "All requirements installed. Next steps:"
 echo "  1. Edit routes.json"
-echo "  2. scripts/apply.sh      # generate + deploy + reload Caddy"
-echo "  3. scripts/funnel-on.sh  # expose via Tailscale Funnel"
+echo "  2. scripts/apply.sh          # generate + deploy + reload Caddy"
+echo "  3. scripts/funnel-on.sh      # expose via Tailscale Funnel"
+echo "  4. scripts/install-panel.sh  # /default start/stop dashboard"

@@ -1,10 +1,16 @@
 [
     {
-        "path": "/api/*",
-        "port": 8000
-    },
-    {
-        "path": "/*",
-        "port": 3000
+        "projectName": "Flowlet",
+        "launchScript": "$HOME/Flowlet/scripts/launch.sh",
+        "paths": [
+            {
+                "path": "/api/*",
+                "port": 8000
+            },
+            {
+                "path": "/*",
+                "port": 3000
+            }
+        ]
     }
 ]

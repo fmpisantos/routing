@@ -13,6 +13,10 @@
 	handle /importiq/* {
 		reverse_proxy 127.0.0.1:5173
 	}
+	redir /default /default/ 308
+	handle /default/* {
+		reverse_proxy 127.0.0.1:8090
+	}
 	redir /api /api/ 308
 	handle /api/* {
 		reverse_proxy 127.0.0.1:8000
