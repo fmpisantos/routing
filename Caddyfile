@@ -5,13 +5,19 @@
 }
 
 :8080 {
-	handle /flowlet/api/* {
+	redir /importiq/api /importiq/api/ 308
+	handle /importiq/api/* {
+		reverse_proxy 127.0.0.1:3001
+	}
+	redir /importiq /importiq/ 308
+	handle /importiq/* {
+		reverse_proxy 127.0.0.1:5173
+	}
+	redir /api /api/ 308
+	handle /api/* {
 		reverse_proxy 127.0.0.1:8000
 	}
-	handle /flowlet/* {
+	handle /* {
 		reverse_proxy 127.0.0.1:3000
-	}
-	handle {
-		respond "no route configured for this path" 404
 	}
 }

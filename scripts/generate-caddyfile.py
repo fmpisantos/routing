@@ -9,6 +9,10 @@ routes.json is a list of routes:
     ]
 
 Each route forwards requests matching `path` to 127.0.0.1:<port>.
+A path ending in "/*" also covers the bare prefix: "/flowlet" is
+308-redirected to "/flowlet/", so a trailing slash is never required
+(and backends that only serve the slashed path still work). The
+redirect is skipped if an explicit "/flowlet" route exists.
 
 Optional per-route keys:
     "strip": true   — strip the matched prefix before forwarding
@@ -89,11 +93,20 @@ def render(routes, listen_port):
         "",
         f":{listen_port} {{",
     ]
+    all_paths = {r["path"] for r in routes}
     for route in routes:
+        path, port = route["path"], route["port"]
         directive = "handle_path" if route.get("strip") else "handle"
+        # Redirect the bare prefix ("/flowlet" -> "/flowlet/") so a trailing
+        # slash is never required, even for backends that only serve the
+        # slashed path. Caddy orders redir before handle, so an explicit
+        # route for the bare path must suppress the redirect.
+        base = path[:-2] if path.endswith("/*") and len(path) > 2 else None
+        if base and base not in all_paths and base + "/" not in all_paths:
+            lines.append(f"\tredir {base} {base}/ 308")
         lines += [
-            f"\t{directive} {route['path']} {{",
-            f"\t\treverse_proxy 127.0.0.1:{route['port']}",
+            f"\t{directive} {path} {{",
+            f"\t\treverse_proxy 127.0.0.1:{port}",
             "\t}",
         ]
     if not has_catch_all:
