@@ -1,0 +1,10 @@
+[
+    {
+        "path": "/flowlet/api/*",
+        "port": 8000
+    },
+    {
+        "path": "/flowlet/*",
+        "port": 3000
+    }
+]
