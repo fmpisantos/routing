@@ -71,6 +71,9 @@ it by hand; edit `routes.json` and re-run `scripts/apply.sh`.
 - `tailscale` with Funnel enabled for this host
 - `python3` (stdlib only)
 
+Run `./init.sh` to install all of the above (Debian/Ubuntu) and bootstrap
+`routes.json` from the example.
+
 ## Notes
 
 - `PROXY_PORT` env var changes the Caddy listen port everywhere
