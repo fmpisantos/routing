@@ -20,8 +20,9 @@ A path ending in "/*" also covers the bare prefix: "/flowlet" is
 (and backends that only serve the slashed path still work). The
 redirect is skipped if an explicit "/flowlet" route exists.
 
-"launchScript" is not used here — it is read by scripts/panel.py, the
-control panel served at /default that can start/stop projects. The
+"launchScript" and "appPath" are not used here — they are read by
+scripts/panel.py, the control panel served at /default that can
+start/stop projects (and git pull --rebase in "appPath" on update). The
 /default prefix is reserved: a route for it (to the panel's port,
 $PANEL_PORT or 8090) is injected automatically.
 
@@ -72,7 +73,7 @@ def load_routes(config_path):
         if not isinstance(project, dict):
             fail(f"{where}: must be an object")
 
-        unknown = set(project) - {"projectName", "launchScript", "paths"}
+        unknown = set(project) - {"projectName", "launchScript", "appPath", "paths"}
         if unknown:
             fail(f"{where}: unknown keys: {', '.join(sorted(unknown))}")
 

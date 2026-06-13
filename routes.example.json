@@ -2,6 +2,7 @@
     {
         "projectName": "Flowlet",
         "launchScript": "$HOME/Flowlet/scripts/launch.sh",
+        "appPath": "$HOME/Flowlet",
         "paths": [
             {
                 "path": "/api/*",

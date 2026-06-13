@@ -19,6 +19,7 @@ Tailscale Funnel ──► Caddy on 127.0.0.1:8080
     {
         "projectName": "Flowlet",
         "launchScript": "$HOME/Flowlet/scripts/launch.sh",
+        "appPath": "$HOME/Flowlet",
         "paths": [
             {
                 "path": "/flowlet/api/*",
@@ -44,6 +45,11 @@ catch-all route.
 expand). Projects without one still show status and can be stopped, but
 not started.
 
+`appPath` is optional — the project's git working directory (`$HOME`/`~`
+expand). When set alongside `launchScript`, the panel's **Update &
+Restart** button stops the project, runs `git pull --rebase` there, and
+starts it again.
+
 Optional per-path key:
 
 - `"strip": true` — strip the matched prefix before forwarding
@@ -67,6 +73,32 @@ is a reserved prefix and cannot be used in `routes.json`.
 - **Stop** SIGTERMs the process groups listening on the project's ports
   (it works even for projects started outside the panel, as long as
   they run as the same user), escalating to SIGKILL after 5 s.
+- **Update & Restart** (shown when a project has both `launchScript` and
+  `appPath`) stops the project, runs `git pull --rebase` in `appPath`,
+  then starts it again. It runs in the background and streams each step
+  to the launch log; if the pull fails (e.g. local changes, conflicts)
+  it stops there and does not restart.
+- **Apply routes** (header button) runs `scripts/apply.sh` — regenerate
+  the Caddyfile from `routes.json`, validate it, deploy it to
+  `/etc/caddy` and reload Caddy — so route edits take effect without
+  shelling in. Output appears under "apply output". The deploy + reload
+  steps use `sudo`, so see the note below for it to work from the panel.
+
+> **Passwordless sudo for Apply routes:** the panel runs as your user
+> (see `install-panel.sh`), and `apply.sh` uses `sudo` to write
+> `/etc/caddy/Caddyfile` and reload Caddy. From the panel there is no
+> terminal to type a password, so grant just those two commands via a
+> sudoers drop-in (replace `<user>`):
+>
+> ```sh
+> sudo tee /etc/sudoers.d/routing-panel >/dev/null <<'EOF'
+> <user> ALL=(root) NOPASSWD: /usr/bin/cp * /etc/caddy/Caddyfile, /usr/bin/systemctl reload-or-restart caddy
+> EOF
+> sudo chmod 440 /etc/sudoers.d/routing-panel
+> ```
+>
+> Without this, the button still works but the apply output shows a
+> `sudo: a password is required` error instead of reloading Caddy.
 
 Install it as a systemd service:
 

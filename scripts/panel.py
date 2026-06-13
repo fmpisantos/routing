@@ -20,6 +20,12 @@ API (the /default prefix is optional when hitting the port directly):
   GET  /default/api/projects/<name>/log   captured launch output (tail)
   POST /default/api/projects/<name>/start
   POST /default/api/projects/<name>/stop
+  POST /default/api/projects/<name>/update  stop, git pull --rebase in
+                                            "appPath", then start again
+  GET  /default/api/apply                 apply status + output (tail)
+  POST /default/api/apply                 run scripts/apply.sh (regenerate
+                                          the Caddyfile from routes.json
+                                          and reload Caddy)
 
 Env:
   PANEL_PORT     listen port (default 8090)
@@ -51,9 +57,18 @@ STATE_DIR = Path(os.environ.get("XDG_STATE_HOME",
                                 str(Path.home() / ".local/state"))) / "routing-panel"
 LOG_DIR = STATE_DIR / "logs"
 PGID_FILE = STATE_DIR / "pgids.json"
+APPLY_SCRIPT = ROOT / "scripts" / "apply.sh"
+APPLY_LOG = STATE_DIR / "apply.log"
 
 lock = threading.Lock()
 pgids = {}  # projectName -> pgid of the process group we launched
+updating = set()  # projectNames currently mid update-and-restart
+applying = False  # scripts/apply.sh currently running (global, not per-project)
+
+
+def expand(path):
+    """Expand $VARS and ~ in a config path (launchScript-style)."""
+    return os.path.expanduser(os.path.expandvars(path)) if path else path
 
 
 class PanelError(Exception):
@@ -164,10 +179,13 @@ def project_status():
                  else "stopped" if up == 0 else "partial")
         with lock:
             managed = name in pgids and group_alive(pgids[name])
+            is_updating = name in updating
         out.append({
             "projectName": name,
             "canLaunch": bool(project.get("launchScript")),
+            "canUpdate": bool(project.get("launchScript") and project.get("appPath")),
             "managed": managed,
+            "updating": is_updating,
             "ports": ports,
             "state": state,
         })
@@ -249,10 +267,132 @@ def stop_project(project):
     return {"ok": True, "signalled": sorted(groups)}
 
 
+def update_project(project):
+    """Stop the project, git pull --rebase in its appPath, then start it.
+
+    Runs in a background thread: stopping escalates to SIGKILL after 5s and
+    the pull can block, so we return immediately and stream progress to the
+    project's launch log (viewable under "launch log" on the page). Status
+    reports the project as `updating` for the duration.
+    """
+    name = project["projectName"]
+    if not project.get("launchScript"):
+        raise PanelError(400, f"{name} has no launchScript configured")
+    app_path = expand(project.get("appPath", ""))
+    if not app_path:
+        raise PanelError(400, f"{name} has no appPath configured")
+    if not Path(app_path).is_dir():
+        raise PanelError(400, f"{name}'s appPath is not a directory: {app_path}")
+    with lock:
+        if name in updating:
+            raise PanelError(409, f"{name} is already updating")
+        updating.add(name)
+    threading.Thread(target=_run_update, args=(project, app_path),
+                     daemon=True).start()
+    return {"ok": True, "detail": "update started"}
+
+
+def _run_update(project, app_path):
+    name = project["projectName"]
+    log_file = LOG_DIR / f"{slug(name)}.log"
+    try:
+        with open(log_file, "ab") as log:
+            def emit(msg):
+                log.write(f"--- update {time.strftime('%F %T')}: {msg}\n".encode())
+                log.flush()
+
+            emit("stopping")
+            try:
+                stop_project(project)
+            except PanelError as e:
+                emit(f"stop: {e}")
+
+            # wait for the ports to be released (stop may SIGKILL only at 5s)
+            ports = project_ports(project)
+            for _ in range(120):  # up to ~12s
+                if not any(port in listen_inodes() for port in ports):
+                    break
+                time.sleep(0.1)
+            else:
+                emit("ports still in use after stop; pulling anyway")
+
+            emit(f"git pull --rebase in {app_path}")
+            result = subprocess.run(
+                ["git", "pull", "--rebase"],
+                cwd=app_path,
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+            )
+            if result.returncode != 0:
+                emit(f"git pull --rebase failed (exit {result.returncode}); "
+                     "not restarting")
+                return
+
+            emit("starting")
+            try:
+                start_project(project)
+            except PanelError as e:
+                emit(f"start: {e}")
+    finally:
+        with lock:
+            updating.discard(name)
+
+
 def log_tail(name, max_bytes=16384):
     log_file = LOG_DIR / f"{slug(name)}.log"
     try:
         with open(log_file, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - max_bytes))
+            return f.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def apply_routes():
+    """Run scripts/apply.sh in the background, streaming output to APPLY_LOG.
+
+    apply.sh regenerates the Caddyfile, validates it, deploys it to
+    /etc/caddy and reloads Caddy. The deploy + reload use sudo, so this
+    only succeeds non-interactively if the panel's user has passwordless
+    sudo for those commands (see the README); otherwise the sudo failure
+    shows up in the apply output.
+    """
+    global applying
+    with lock:
+        if applying:
+            raise PanelError(409, "apply is already running")
+        applying = True
+    threading.Thread(target=_run_apply, daemon=True).start()
+    return {"ok": True, "detail": "apply started"}
+
+
+def _run_apply():
+    global applying
+    try:
+        with open(APPLY_LOG, "wb") as log:  # truncate: keep only the latest run
+            log.write(f"--- apply {time.strftime('%F %T')}: "
+                      f"{APPLY_SCRIPT} {CONFIG}\n".encode())
+            log.flush()
+            result = subprocess.run(
+                ["bash", str(APPLY_SCRIPT), str(CONFIG)],
+                cwd=str(ROOT),
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+            )
+            tail = ("done" if result.returncode == 0
+                    else f"FAILED (exit {result.returncode})")
+            log.write(f"--- apply {tail}\n".encode())
+    finally:
+        with lock:
+            applying = False
+
+
+def apply_tail(max_bytes=65536):
+    try:
+        with open(APPLY_LOG, "rb") as f:
             f.seek(0, os.SEEK_END)
             f.seek(max(0, f.tell() - max_bytes))
             return f.read().decode("utf-8", "replace")
@@ -301,6 +441,7 @@ button:hover:enabled{border-color:var(--accent)}
 button.stop:hover:enabled{border-color:var(--red);color:var(--red)}
 button:disabled{opacity:.45;cursor:default}
 details{margin-top:12px;font-size:12px}
+#applybox{margin:4px 28px 0;padding:0}
 summary{color:var(--dim);cursor:pointer;user-select:none}
 pre{background:#0b0d11;border:1px solid var(--line);border-radius:6px;
     padding:8px 10px;max-height:240px;overflow:auto;white-space:pre-wrap;
@@ -308,8 +449,11 @@ pre{background:#0b0d11;border:1px solid var(--line);border-radius:6px;
 </style>
 </head>
 <body>
-<header><h1>Projects</h1><span id="updated"></span></header>
+<header><h1>Projects</h1>
+<button id="apply" title="regenerate the Caddyfile from routes.json and reload Caddy">Apply routes</button>
+<span id="updated"></span></header>
 <div id="err"></div>
+<details id="applybox"><summary>apply output</summary><pre id="applylog">…</pre></details>
 <main id="grid"></main>
 <script>
 const TKEY = 'routing-panel-token';
@@ -342,6 +486,7 @@ function showErr(msg) { document.getElementById('err').textContent = msg; }
 
 async function act(name, what) {
   busy.add(name);
+  if (what === 'update') openLogs.add(name);  // surface progress as it streams
   render(last);
   try {
     const r = await api('api/projects/' + encodeURIComponent(name) + '/' + what, {method: 'POST'});
@@ -350,8 +495,10 @@ async function act(name, what) {
   } catch (e) {
     showErr(String(e));
   }
-  // give the process a moment to bind/release its ports before re-polling
-  setTimeout(() => { busy.delete(name); refresh(); }, what === 'start' ? 1500 : 800);
+  // give the process a moment to bind/release its ports before re-polling;
+  // for update, the server keeps reporting `updating` until the restart lands
+  setTimeout(() => { busy.delete(name); refresh(); },
+             what === 'start' || what === 'update' ? 1500 : 800);
 }
 
 async function loadLog(name, card) {
@@ -375,22 +522,28 @@ function render(projects) {
       '<td class="mono">:' + pt.port + '</td>' +
       '<td class="mono">' + (pt.listening ? '<span class="on-text">listening</span>' : 'down') + '</td></tr>'
     ).join('');
-    const isBusy = busy.has(p.projectName);
+    const isBusy = busy.has(p.projectName) || p.updating;
     const startOff = !p.canLaunch || p.state === 'running' || isBusy;
     const stopOff = (p.state === 'stopped' && !p.managed) || isBusy;
+    const updateOff = !p.canUpdate || isBusy;
+    const badge = p.updating ? 'updating…' : isBusy ? 'working…' : p.state;
     card.innerHTML =
       '<div class="head"><h2>' + esc(p.projectName) + '</h2>' +
-      '<span class="badge ' + p.state + '">' + (isBusy ? 'working…' : p.state) + '</span></div>' +
+      '<span class="badge ' + p.state + '">' + badge + '</span></div>' +
       '<table>' + rows + '</table>' +
       '<div class="actions">' +
       '<button class="start"' + (startOff ? ' disabled' : '') +
       (p.canLaunch ? '' : ' title="no launchScript configured"') + '>Start</button>' +
       '<button class="stop"' + (stopOff ? ' disabled' : '') + '>Stop</button>' +
+      '<button class="update"' + (updateOff ? ' disabled' : '') +
+      (p.canUpdate ? '' : ' title="needs launchScript and appPath"') +
+      '>Update &amp; Restart</button>' +
       '</div>' +
       '<details' + (openLogs.has(p.projectName) ? ' open' : '') +
       '><summary>launch log</summary><pre>…</pre></details>';
     card.querySelector('.start').onclick = () => act(p.projectName, 'start');
     card.querySelector('.stop').onclick = () => act(p.projectName, 'stop');
+    card.querySelector('.update').onclick = () => act(p.projectName, 'update');
     const det = card.querySelector('details');
     det.addEventListener('toggle', () => {
       det.open ? openLogs.add(p.projectName) : openLogs.delete(p.projectName);
@@ -414,7 +567,48 @@ async function refresh() {
   }
 }
 
+let applyBusy = false;
+
+function setApplyBtn() {
+  const b = document.getElementById('apply');
+  b.disabled = applyBusy;
+  b.textContent = applyBusy ? 'Applying…' : 'Apply routes';
+}
+
+// Pull the latest apply output; keeps polling while a run is in progress.
+async function showApply(open) {
+  const r = await api('api/apply');
+  if (!r || !r.ok) return;
+  const d = await r.json();
+  const pre = document.getElementById('applylog');
+  pre.textContent = d.log || '(no apply has run yet)';
+  pre.scrollTop = pre.scrollHeight;
+  applyBusy = d.applying;
+  setApplyBtn();
+  if (open) document.getElementById('applybox').open = true;
+  if (d.applying) setTimeout(() => showApply(false), 800);
+}
+
+async function apply() {
+  applyBusy = true;
+  setApplyBtn();
+  try {
+    const r = await api('api/apply', {method: 'POST'});
+    const d = await r.json().catch(() => ({}));
+    showErr(r.ok ? '' : (d.error || ('apply failed (' + r.status + ')')));
+  } catch (e) {
+    showErr(String(e));
+  }
+  showApply(true);  // reveal output and start polling until it finishes
+}
+
+document.getElementById('apply').onclick = apply;
+document.getElementById('applybox').addEventListener('toggle', e => {
+  if (e.target.open) showApply(false);
+});
+
 refresh();
+showApply(false);  // sync button state in case an apply is already running
 setInterval(refresh, 3000);
 </script>
 </body>
@@ -457,7 +651,15 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if method == "GET" and path == "/api/projects":
                 return self._send(200, project_status())
-            m = re.fullmatch(r"/api/projects/([^/]+)/(log|start|stop)", path)
+            if path == "/api/apply":
+                if method == "POST":
+                    return self._send(200, apply_routes())
+                if method == "GET":
+                    with lock:
+                        running = applying
+                    return self._send(200, {"applying": running,
+                                            "log": apply_tail()})
+            m = re.fullmatch(r"/api/projects/([^/]+)/(log|start|stop|update)", path)
             if m:
                 name, action = unquote(m.group(1)), m.group(2)
                 if method == "GET" and action == "log":
@@ -468,6 +670,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, start_project(find_project(name)))
                 if method == "POST" and action == "stop":
                     return self._send(200, stop_project(find_project(name)))
+                if method == "POST" and action == "update":
+                    return self._send(200, update_project(find_project(name)))
             self._send(404, {"error": "not found"})
         except PanelError as e:
             self._send(e.code, {"error": str(e)})
