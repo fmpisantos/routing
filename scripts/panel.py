@@ -18,6 +18,10 @@ API (the /default prefix is optional when hitting the port directly):
   GET  /default/                          dashboard (HTML)
   GET  /default/api/projects              status JSON
   GET  /default/api/projects/<name>/log   captured launch output (tail)
+  GET  /default/api/projects/<name>/env   per-project env overrides {KEY: value}
+  POST /default/api/projects/<name>/env   replace the project's env overrides
+                                          (body: {"env": {KEY: value, ...}});
+                                          applied on the next start/restart
   POST /default/api/projects/<name>/start
   POST /default/api/projects/<name>/stop
   POST /default/api/projects/<name>/update  stop, git pull --rebase in
@@ -57,6 +61,8 @@ STATE_DIR = Path(os.environ.get("XDG_STATE_HOME",
                                 str(Path.home() / ".local/state"))) / "routing-panel"
 LOG_DIR = STATE_DIR / "logs"
 PGID_FILE = STATE_DIR / "pgids.json"
+ENV_FILE = STATE_DIR / "env.json"
+ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*$")
 APPLY_SCRIPT = ROOT / "scripts" / "apply.sh"
 APPLY_LOG = STATE_DIR / "apply.log"
 
@@ -165,6 +171,50 @@ def save_pgids():
     PGID_FILE.write_text(json.dumps(pgids))
 
 
+def load_env_overrides():
+    """Map of projectName -> {KEY: value} of user-set env overrides."""
+    try:
+        data = json.loads(ENV_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return data
+
+
+def project_env_overrides(name):
+    env = load_env_overrides().get(name, {})
+    return env if isinstance(env, dict) else {}
+
+
+def set_project_env_overrides(name, env):
+    """Validate and persist the full env override table for one project."""
+    if not isinstance(env, dict):
+        raise PanelError(400, "\"env\" must be an object of KEY: value pairs")
+    clean = {}
+    for key, value in env.items():
+        if not isinstance(key, str) or not ENV_NAME_RE.fullmatch(key):
+            raise PanelError(400, f"invalid env var name: {key!r} (must match "
+                                  "[A-Za-z_][A-Za-z0-9_]*)")
+        if value is None:
+            continue  # treat null as "remove"
+        if not isinstance(value, (str, int, float, bool)):
+            raise PanelError(400, f"value for {key} must be a string or number")
+        clean[key] = str(value)
+    with lock:
+        data = load_env_overrides()
+        if clean:
+            data[name] = clean
+        else:
+            data.pop(name, None)
+        ENV_FILE.write_text(json.dumps(data, indent=2))
+        try:
+            os.chmod(ENV_FILE, 0o600)  # may hold secrets
+        except OSError:
+            pass
+    return clean
+
+
 def project_status():
     by_port = listen_inodes()
     out = []
@@ -188,6 +238,7 @@ def project_status():
             "updating": is_updating,
             "ports": ports,
             "state": state,
+            "envCount": len(project_env_overrides(name)),
         })
     return out
 
@@ -203,9 +254,14 @@ def start_project(project):
     if ports and all(port in by_port for port in ports):
         raise PanelError(409, f"{name} is already running")
 
+    overrides = project_env_overrides(name)
+    proc_env = {**os.environ, **overrides} if overrides else None
+
     log_file = LOG_DIR / f"{slug(name)}.log"
     with open(log_file, "ab") as log:
         log.write(f"\n--- start {time.strftime('%F %T')}: {script}\n".encode())
+        if overrides:
+            log.write(f"--- env overrides: {', '.join(sorted(overrides))}\n".encode())
         proc = subprocess.Popen(
             ["bash", "-lc", script],
             cwd=str(Path.home()),
@@ -213,6 +269,7 @@ def start_project(project):
             stdout=log,
             stderr=subprocess.STDOUT,
             start_new_session=True,  # own process group, survives the panel
+            env=proc_env,  # None inherits the panel's env unchanged
         )
     with lock:
         pgids[name] = proc.pid
@@ -446,6 +503,20 @@ summary{color:var(--dim);cursor:pointer;user-select:none}
 pre{background:#0b0d11;border:1px solid var(--line);border-radius:6px;
     padding:8px 10px;max-height:240px;overflow:auto;white-space:pre-wrap;
     font-size:11px}
+.env{margin-top:8px}
+.env table{margin:0 0 8px}
+.env td{padding:2px 4px 2px 0;vertical-align:middle}
+.env input{font:inherit;font-size:12px;font-family:ui-monospace,SFMono-Regular,monospace;
+    width:100%;padding:4px 6px;border-radius:5px;border:1px solid var(--line);
+    background:#0b0d11;color:var(--text)}
+.env input:focus{outline:none;border-color:var(--accent)}
+.env .k{width:42%}
+.env .rm{padding:3px 9px;color:var(--dim)}
+.env .rm:hover:enabled{border-color:var(--red);color:var(--red)}
+.env .foot{display:flex;gap:8px;align-items:center}
+.env .savestate{color:var(--dim);font-size:11px}
+.env .savestate.saved{color:var(--green)}
+.env .note{margin-left:auto;color:var(--dim);font-size:11px}
 </style>
 </head>
 <body>
@@ -459,6 +530,7 @@ pre{background:#0b0d11;border:1px solid var(--line);border-radius:6px;
 const TKEY = 'routing-panel-token';
 const busy = new Set();
 const openLogs = new Set();
+const openEnv = new Set();
 let last = [];
 
 function authHeaders() {
@@ -501,6 +573,82 @@ async function act(name, what) {
              what === 'start' || what === 'update' ? 1500 : 800);
 }
 
+// --- per-project environment variables -------------------------------------
+// envEdit holds the in-progress rows so edits survive the 3s refresh re-render;
+// envDirty marks projects whose table has unsaved changes (don't clobber them
+// by refetching from the server).
+const envEdit = {};
+const envDirty = new Set();
+
+function readEnvRows(card) {
+  return [...card.querySelectorAll('.rows tr')].map(tr => ({
+    k: tr.querySelector('.ek').value.trim(),
+    v: tr.querySelector('.ev').value,
+  }));
+}
+
+function markEnvDirty(name, card) {
+  envDirty.add(name);
+  envEdit[name] = readEnvRows(card);
+  const s = card.querySelector('.savestate');
+  if (s) { s.textContent = 'unsaved'; s.className = 'savestate'; }
+}
+
+function addEnvRow(card, k, v) {
+  const name = card.dataset.name;
+  const tr = document.createElement('tr');
+  const kc = document.createElement('td'); kc.className = 'k';
+  const ki = document.createElement('input');
+  ki.className = 'ek'; ki.placeholder = 'KEY'; ki.value = k; kc.appendChild(ki);
+  const vc = document.createElement('td');
+  const vi = document.createElement('input');
+  vi.className = 'ev'; vi.placeholder = 'value'; vi.value = v; vc.appendChild(vi);
+  const rc = document.createElement('td');
+  const rb = document.createElement('button');
+  rb.className = 'rm'; rb.type = 'button'; rb.textContent = '✕'; rb.title = 'remove';
+  rc.appendChild(rb);
+  tr.append(kc, vc, rc);
+  rb.onclick = () => { tr.remove(); markEnvDirty(name, card); };
+  ki.oninput = vi.oninput = () => markEnvDirty(name, card);
+  card.querySelector('.rows').appendChild(tr);
+}
+
+function renderEnvRows(card, rows) {
+  card.querySelector('.rows').innerHTML = '';
+  for (const r of rows) addEnvRow(card, r.k, r.v);
+}
+
+async function loadEnv(name, card) {
+  if (envDirty.has(name)) { renderEnvRows(card, envEdit[name] || []); return; }
+  const r = await api('api/projects/' + encodeURIComponent(name) + '/env');
+  if (!r || !r.ok) return;
+  const d = await r.json().catch(() => ({}));
+  const rows = Object.entries(d.env || {}).map(([k, v]) => ({k, v}));
+  envEdit[name] = rows;
+  renderEnvRows(card, rows);
+}
+
+async function saveEnv(name, card) {
+  const env = {};
+  for (const {k, v} of readEnvRows(card)) { if (k) env[k] = v; }
+  const state = card.querySelector('.savestate');
+  try {
+    const r = await api('api/projects/' + encodeURIComponent(name) + '/env',
+      {method: 'POST', headers: {'Content-Type': 'application/json'},
+       body: JSON.stringify({env})});
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) { showErr(d.error || ('save env failed (' + r.status + ')')); return; }
+    envDirty.delete(name);
+    envEdit[name] = Object.entries(d.env || {}).map(([k, v]) => ({k, v}));
+    renderEnvRows(card, envEdit[name]);
+    if (state) { state.textContent = 'saved'; state.className = 'savestate saved'; }
+    showErr('');
+    refresh();  // refresh the (n) count in the section header
+  } catch (e) {
+    showErr(String(e));
+  }
+}
+
 async function loadLog(name, card) {
   const r = await api('api/projects/' + encodeURIComponent(name) + '/log');
   if (r && r.ok) {
@@ -517,6 +665,7 @@ function render(projects) {
   for (const p of projects) {
     const card = document.createElement('div');
     card.className = 'card';
+    card.dataset.name = p.projectName;
     const rows = p.ports.map(pt =>
       '<tr><td><span class="dot ' + (pt.listening ? 'on' : '') + '"></span>' + esc(pt.path) + '</td>' +
       '<td class="mono">:' + pt.port + '</td>' +
@@ -539,12 +688,34 @@ function render(projects) {
       (p.canUpdate ? '' : ' title="needs launchScript and appPath"') +
       '>Update &amp; Restart</button>' +
       '</div>' +
-      '<details' + (openLogs.has(p.projectName) ? ' open' : '') +
+      '<details class="envbox"' + (openEnv.has(p.projectName) ? ' open' : '') +
+      '><summary>environment' + (p.envCount ? ' (' + p.envCount + ')' : '') +
+      '</summary><div class="env">' +
+      '<table class="rows"></table>' +
+      '<div class="foot">' +
+      '<button class="addvar">+ variable</button>' +
+      '<button class="savevar">Save</button>' +
+      '<span class="savestate"></span>' +
+      '<span class="note">applied on next start / restart</span>' +
+      '</div></div></details>' +
+      '<details class="logbox"' + (openLogs.has(p.projectName) ? ' open' : '') +
       '><summary>launch log</summary><pre>…</pre></details>';
     card.querySelector('.start').onclick = () => act(p.projectName, 'start');
     card.querySelector('.stop').onclick = () => act(p.projectName, 'stop');
     card.querySelector('.update').onclick = () => act(p.projectName, 'update');
-    const det = card.querySelector('details');
+
+    const env = card.querySelector('.envbox');
+    env.addEventListener('toggle', () => {
+      env.open ? openEnv.add(p.projectName) : openEnv.delete(p.projectName);
+      if (env.open) loadEnv(p.projectName, card);
+    });
+    card.querySelector('.addvar').onclick = () => {
+      addEnvRow(card, '', ''); markEnvDirty(p.projectName, card);
+    };
+    card.querySelector('.savevar').onclick = () => saveEnv(p.projectName, card);
+    if (env.open) loadEnv(p.projectName, card);
+
+    const det = card.querySelector('.logbox');
     det.addEventListener('toggle', () => {
       det.open ? openLogs.add(p.projectName) : openLogs.delete(p.projectName);
       if (det.open) loadLog(p.projectName, card);
@@ -555,6 +726,9 @@ function render(projects) {
 }
 
 async function refresh() {
+  // a full re-render steals focus; pause while the user types in an env field
+  const active = document.activeElement;
+  if (active && active.closest && active.closest('.env')) return;
   try {
     const r = await api('api/projects');
     if (!r.ok) { showErr('status fetch failed (' + r.status + ')'); return; }
@@ -645,6 +819,19 @@ class Handler(BaseHTTPRequestHandler):
     def _authed(self):
         return not TOKEN or self.headers.get("X-Panel-Token") == TOKEN
 
+    def _json_body(self):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = 0
+        raw = self.rfile.read(length) if length > 0 else b""
+        if not raw:
+            return {}
+        try:
+            return json.loads(raw)
+        except ValueError:
+            raise PanelError(400, "request body must be valid JSON")
+
     def _dispatch(self, path, method):
         if not self._authed():
             return self._send(401, {"error": "missing or bad X-Panel-Token"})
@@ -659,13 +846,20 @@ class Handler(BaseHTTPRequestHandler):
                         running = applying
                     return self._send(200, {"applying": running,
                                             "log": apply_tail()})
-            m = re.fullmatch(r"/api/projects/([^/]+)/(log|start|stop|update)", path)
+            m = re.fullmatch(r"/api/projects/([^/]+)/(log|env|start|stop|update)", path)
             if m:
                 name, action = unquote(m.group(1)), m.group(2)
                 if method == "GET" and action == "log":
                     find_project(name)  # 404 for unknown names
                     return self._send(200, log_tail(name).encode(),
                                       "text/plain; charset=utf-8")
+                if action == "env":
+                    find_project(name)  # 404 for unknown names
+                    if method == "GET":
+                        return self._send(200, {"env": project_env_overrides(name)})
+                    if method == "POST":
+                        env = set_project_env_overrides(name, self._json_body().get("env", {}))
+                        return self._send(200, {"ok": True, "env": env})
                 if method == "POST" and action == "start":
                     return self._send(200, start_project(find_project(name)))
                 if method == "POST" and action == "stop":

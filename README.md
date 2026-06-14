@@ -78,6 +78,16 @@ is a reserved prefix and cannot be used in `routes.json`.
   then starts it again. It runs in the background and streams each step
   to the launch log; if the pull fails (e.g. local changes, conflicts)
   it stops there and does not restart.
+- **Environment** (per project, expandable) is an editable table of env
+  variables the panel injects into the project's process when it starts.
+  Add/edit/remove rows and hit **Save**; they take effect on the next
+  **Start** or **Update & Restart** (not on an already-running process).
+  Overrides are stored per project in
+  `~/.local/state/routing-panel/env.json` (chmod `600` — it may hold
+  secrets) and so survive `routes.json` regeneration. They are layered on
+  top of the panel's own environment, so a key set here wins over an
+  inherited one of the same name. The header shows a count, e.g.
+  "environment (3)".
 - **Apply routes** (header button) runs `scripts/apply.sh` — regenerate
   the Caddyfile from `routes.json`, validate it, deploy it to
   `/etc/caddy` and reload Caddy — so route edits take effect without
