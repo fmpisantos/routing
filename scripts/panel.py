@@ -17,7 +17,8 @@ run as the same user.
 API (the /default prefix is optional when hitting the port directly):
   GET  /default/                          dashboard (HTML)
   GET  /default/api/projects              status JSON
-  GET  /default/api/projects/<name>/log   captured launch output (tail)
+  GET  /default/api/projects/<name>/log   captured launch output (tail;
+                                          ?full=1 for the full log)
   GET  /default/api/projects/<name>/env   per-project env overrides {KEY: value}
   POST /default/api/projects/<name>/env   replace the project's env overrides
                                           (body: {"env": {KEY: value, ...}});
@@ -50,7 +51,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG = Path(os.environ.get("ROUTES_CONFIG", str(ROOT / "routes.json")))
@@ -396,12 +397,18 @@ def _run_update(project, app_path):
             updating.discard(name)
 
 
-def log_tail(name, max_bytes=16384):
+# Cap "full log" reads so a runaway log can never flood the browser; we still
+# return only the last FULL_LOG_MAX bytes (the tail people actually want).
+FULL_LOG_MAX = 2 * 1024 * 1024
+
+
+def log_tail(name, max_bytes=16384, full=False):
     log_file = LOG_DIR / f"{slug(name)}.log"
+    cap = FULL_LOG_MAX if full else max_bytes
     try:
         with open(log_file, "rb") as f:
             f.seek(0, os.SEEK_END)
-            f.seek(max(0, f.tell() - max_bytes))
+            f.seek(max(0, f.tell() - cap))
             return f.read().decode("utf-8", "replace")
     except OSError:
         return ""
@@ -503,6 +510,11 @@ summary{color:var(--dim);cursor:pointer;user-select:none}
 pre{background:#0b0d11;border:1px solid var(--line);border-radius:6px;
     padding:8px 10px;max-height:240px;overflow:auto;white-space:pre-wrap;
     font-size:11px}
+.logbar{display:flex;align-items:center;gap:12px;margin:8px 0 0;
+    font-size:11px;color:var(--dim)}
+.logbar label{display:flex;align-items:center;gap:5px;cursor:pointer}
+.logbar .live{color:var(--green)}
+.logbar .lognote{margin-left:auto;font-family:ui-monospace,SFMono-Regular,monospace}
 .env{margin-top:8px}
 .env table{margin:0 0 8px}
 .env td{padding:2px 4px 2px 0;vertical-align:middle}
@@ -530,6 +542,8 @@ pre{background:#0b0d11;border:1px solid var(--line);border-radius:6px;
 const TKEY = 'routing-panel-token';
 const busy = new Set();
 const openLogs = new Set();
+const logFull = new Set();     // projects showing the full log (vs. the tail)
+const logLoading = new Set();  // in-flight log fetches, so polls don't pile up
 const openEnv = new Set();
 let last = [];
 
@@ -650,11 +664,26 @@ async function saveEnv(name, card) {
 }
 
 async function loadLog(name, card) {
-  const r = await api('api/projects/' + encodeURIComponent(name) + '/log');
-  if (r && r.ok) {
-    const pre = card.querySelector('pre');
-    pre.textContent = (await r.text()) || '(no output captured yet)';
-    pre.scrollTop = pre.scrollHeight;
+  if (logLoading.has(name)) return;  // a fetch is already in flight for this card
+  const pre = card.querySelector('.logbox pre');
+  if (!pre) return;
+  const full = logFull.has(name);
+  logLoading.add(name);
+  try {
+    const r = await api('api/projects/' + encodeURIComponent(name) + '/log' +
+                        (full ? '?full=1' : ''));
+    if (!r || !r.ok) return;
+    const text = await r.text();
+    // keep the user's place if they scrolled up to read; follow only at bottom
+    const atBottom = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 24;
+    pre.textContent = text || '(no output captured yet)';
+    const note = card.querySelector('.logbox .lognote');
+    if (note) note.textContent =
+      (text ? Math.ceil(text.length / 1024) + ' KB' : '0 KB') +
+      (full ? ' · full' : ' · tail');
+    if (atBottom) pre.scrollTop = pre.scrollHeight;
+  } finally {
+    logLoading.delete(name);
   }
 }
 
@@ -699,7 +728,13 @@ function render(projects) {
       '<span class="note">applied on next start / restart</span>' +
       '</div></div></details>' +
       '<details class="logbox"' + (openLogs.has(p.projectName) ? ' open' : '') +
-      '><summary>launch log</summary><pre>…</pre></details>';
+      '><summary>launch log</summary>' +
+      '<div class="logbar">' +
+      '<label><input type="checkbox" class="logfull"' +
+      (logFull.has(p.projectName) ? ' checked' : '') + '> full log</label>' +
+      '<span class="live">● live</span>' +
+      '<span class="lognote"></span>' +
+      '</div><pre>…</pre></details>';
     card.querySelector('.start').onclick = () => act(p.projectName, 'start');
     card.querySelector('.stop').onclick = () => act(p.projectName, 'stop');
     card.querySelector('.update').onclick = () => act(p.projectName, 'update');
@@ -720,6 +755,10 @@ function render(projects) {
       det.open ? openLogs.add(p.projectName) : openLogs.delete(p.projectName);
       if (det.open) loadLog(p.projectName, card);
     });
+    card.querySelector('.logfull').onchange = e => {
+      e.target.checked ? logFull.add(p.projectName) : logFull.delete(p.projectName);
+      loadLog(p.projectName, card);
+    };
     if (det.open) loadLog(p.projectName, card);
     grid.appendChild(card);
   }
@@ -781,9 +820,19 @@ document.getElementById('applybox').addEventListener('toggle', e => {
   if (e.target.open) showApply(false);
 });
 
+// Live tail: refresh any open log between the slower full-grid refreshes,
+// updating just its <pre> so the view doesn't flicker or lose scroll.
+function pollLogs() {
+  if (!openLogs.size) return;
+  for (const card of document.querySelectorAll('#grid .card')) {
+    if (openLogs.has(card.dataset.name)) loadLog(card.dataset.name, card);
+  }
+}
+
 refresh();
 showApply(false);  // sync button state in case an apply is already running
 setInterval(refresh, 3000);
+setInterval(pollLogs, 1500);
 </script>
 </body>
 </html>
@@ -851,7 +900,9 @@ class Handler(BaseHTTPRequestHandler):
                 name, action = unquote(m.group(1)), m.group(2)
                 if method == "GET" and action == "log":
                     find_project(name)  # 404 for unknown names
-                    return self._send(200, log_tail(name).encode(),
+                    full = parse_qs(urlparse(self.path).query).get(
+                        "full", ["0"])[0] in ("1", "true", "yes")
+                    return self._send(200, log_tail(name, full=full).encode(),
                                       "text/plain; charset=utf-8")
                 if action == "env":
                     find_project(name)  # 404 for unknown names
