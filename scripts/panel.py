@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Control panel for the projects in routes.json, served at /default.
+"""Control panel for the projects in routes.json, served at /default
+(configurable via $PANEL_PATH so several instances can share a host).
 
 Shows, per project, whether each of its ports is listening, and offers
 start/stop for projects that define a "launchScript":
@@ -34,6 +35,7 @@ API (the /default prefix is optional when hitting the port directly):
 
 Env:
   PANEL_PORT     listen port (default 8090)
+  PANEL_PATH     URL prefix the panel is served under (default /default)
   PANEL_BIND     bind address (default 127.0.0.1 — Caddy proxies to us)
   PANEL_TOKEN    if set, API requests must send an X-Panel-Token header.
                  Set this if the proxy is exposed via Funnel: otherwise
@@ -57,6 +59,9 @@ ROOT = Path(__file__).resolve().parent.parent
 CONFIG = Path(os.environ.get("ROUTES_CONFIG", str(ROOT / "routes.json")))
 PORT = int(os.environ.get("PANEL_PORT", "8090"))
 BIND = os.environ.get("PANEL_BIND", "127.0.0.1")
+# URL prefix the panel is served under. Configurable so multiple instances
+# can run on one host. Normalized: single leading '/', no trailing '/'.
+PANEL_PATH = "/" + os.environ.get("PANEL_PATH", "/default").strip().strip("/")
 TOKEN = os.environ.get("PANEL_TOKEN", "")
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME",
                                 str(Path.home() / ".local/state"))) / "routing-panel"
@@ -856,13 +861,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def _path(self):
         path = urlparse(self.path).path
-        if path == "/default":  # relative URLs in the page need the slash
+        if path == PANEL_PATH:  # relative URLs in the page need the slash
             self.send_response(308)
-            self.send_header("Location", "/default/")
+            self.send_header("Location", PANEL_PATH + "/")
             self.end_headers()
             return None
-        if path.startswith("/default/"):
-            path = path[len("/default"):]
+        if path.startswith(PANEL_PATH + "/"):
+            path = path[len(PANEL_PATH):]
         return path
 
     def _authed(self):
@@ -949,7 +954,7 @@ def main():
               "localhost — anyone who can reach it can start/stop projects",
               file=sys.stderr)
     server = ThreadingHTTPServer((BIND, PORT), Handler)
-    print(f"routing panel on http://{BIND}:{PORT}/default  (config: {CONFIG})")
+    print(f"routing panel on http://{BIND}:{PORT}{PANEL_PATH}  (config: {CONFIG})")
     server.serve_forever()
 
 

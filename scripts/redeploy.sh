@@ -22,9 +22,14 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-UNIT=/etc/systemd/system/routing-panel.service
-SERVICE=routing-panel
-PROXY_PORT="${PROXY_PORT:-8080}"
+INSTANCE_NAME="${INSTANCE_NAME:-default}"
+if [[ "$INSTANCE_NAME" == "default" ]]; then
+  SERVICE=routing-panel
+else
+  SERVICE="routing-panel-$INSTANCE_NAME"
+fi
+UNIT="/etc/systemd/system/$SERVICE.service"
+# PROXY_PORT is resolved later (env > current unit > 8080) once unit_env exists.
 
 say()  { printf "\033[36m▸\033[0m %s\n" "$*"; }
 ok()   { printf "\033[32m✓\033[0m %s\n" "$*"; }
@@ -54,6 +59,15 @@ unit_env() {  # unit_env KEY -> value of the unit's `Environment=KEY=value`
 
 export PANEL_PORT="${PANEL_PORT:-$(unit_env PANEL_PORT)}"
 export PANEL_PORT="${PANEL_PORT:-8090}"
+
+# Preserve the rest of the instance's config from the current unit (so a bare
+# `redeploy.sh` regenerates consistently), unless overridden in the env.
+export PANEL_PATH="${PANEL_PATH:-$(unit_env PANEL_PATH)}"
+export PANEL_PATH="${PANEL_PATH:-/$INSTANCE_NAME}"
+export ADMIN_PORT="${ADMIN_PORT:-$(unit_env ADMIN_PORT)}"
+export ADMIN_PORT="${ADMIN_PORT:-2019}"
+PROXY_PORT="${PROXY_PORT:-$(unit_env PROXY_PORT)}"
+export PROXY_PORT="${PROXY_PORT:-8080}"
 
 existing_token="$(unit_env PANEL_TOKEN)"
 if [[ -n "${PANEL_TOKEN:-}" ]]; then
@@ -108,17 +122,17 @@ fi
 ok "listening on 127.0.0.1:$PANEL_PORT"
 
 # Dashboard page needs no token, so this works with or without PANEL_TOKEN set.
-code="$(curl -fsS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PANEL_PORT/default/" || true)"
+code="$(curl -fsS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PANEL_PORT$PANEL_PATH/" || true)"
 [[ "$code" == "200" ]] || die "panel did not return 200 directly (got '${code:-no response}')"
-ok "panel responds 200 at http://127.0.0.1:$PANEL_PORT/default/"
+ok "panel responds 200 at http://127.0.0.1:$PANEL_PORT$PANEL_PATH/"
 
-# Through Caddy — confirms apply.sh wired the /default route in.
-code="$(curl -fsS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PROXY_PORT/default/" || true)"
+# Through Caddy — confirms apply.sh wired the panel route in.
+code="$(curl -fsS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PROXY_PORT$PANEL_PATH/" || true)"
 if [[ "$code" == "200" ]]; then
-  ok "reachable through Caddy at http://127.0.0.1:$PROXY_PORT/default/"
+  ok "reachable through Caddy at http://127.0.0.1:$PROXY_PORT$PANEL_PATH/"
 else
-  warn "panel is up but not reachable through Caddy on :$PROXY_PORT/default/ (got '${code:-no response}')"
-  warn "check that Caddy is running (systemctl status caddy) and that apply.sh succeeded above"
+  warn "panel is up but not reachable through Caddy on :$PROXY_PORT$PANEL_PATH/ (got '${code:-no response}')"
+  warn "check that this instance's Caddy is running and that apply.sh succeeded above"
 fi
 
 echo

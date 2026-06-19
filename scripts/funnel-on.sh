@@ -16,6 +16,15 @@ set -euo pipefail
 PROXY_PORT="${PROXY_PORT:-8080}"
 FUNNEL="${FUNNEL:-1}"
 CMD=$([[ "$FUNNEL" == "1" ]] && echo "funnel" || echo "serve")
+# The default instance uses the distro `caddy` service; named instances run
+# their own caddy-<name>. NOTE: a tailnet node has ONE funnel/serve config,
+# so only one instance can be publicly exposed — the last run of this wins.
+INSTANCE_NAME="${INSTANCE_NAME:-default}"
+if [[ "$INSTANCE_NAME" == "default" ]]; then
+  CADDY_SERVICE=caddy
+else
+  CADDY_SERVICE="caddy-$INSTANCE_NAME"
+fi
 
 say()  { printf "\033[36m▸\033[0m %s\n" "$*"; }
 ok()   { printf "\033[32m✓\033[0m %s\n" "$*"; }
@@ -26,8 +35,8 @@ if ! command -v tailscale >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! systemctl is-active --quiet caddy; then
-  warn "Caddy is not running. Deploy the config first:"
+if ! systemctl is-active --quiet "$CADDY_SERVICE"; then
+  warn "Caddy ($CADDY_SERVICE) is not running. Deploy the config first:"
   warn "  scripts/apply.sh"
   exit 1
 fi

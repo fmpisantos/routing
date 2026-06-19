@@ -11,13 +11,27 @@
 # apply/panel steps simply re-deploy.
 #
 # Env passed through to the steps it runs:
-#   PROXY_PORT  — Caddy listen port (default 8080)
-#   PANEL_PORT  — control panel port (default 8090)
-#   PANEL_TOKEN — panel auth token (recommended if exposed via Funnel)
+#   INSTANCE_NAME — instance id (default "default"). The default instance
+#                   uses the shared distro Caddy; any other name runs its
+#                   own caddy-<name> service so two instances can coexist.
+#   PANEL_PATH    — URL prefix for the panel (default /$INSTANCE_NAME)
+#   PROXY_PORT    — Caddy listen port (default 8080)
+#   PANEL_PORT    — control panel port (default 8090)
+#   ADMIN_PORT    — Caddy admin API port (default 2019; must differ per
+#                   instance)
+#   PANEL_TOKEN   — panel auth token (recommended if exposed via Funnel)
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Instance identity — defaulted + exported so every sub-step agrees.
+INSTANCE_NAME="${INSTANCE_NAME:-default}"
+PANEL_PATH="${PANEL_PATH:-/$INSTANCE_NAME}"
+PROXY_PORT="${PROXY_PORT:-8080}"
+PANEL_PORT="${PANEL_PORT:-8090}"
+ADMIN_PORT="${ADMIN_PORT:-2019}"
+export INSTANCE_NAME PANEL_PATH PROXY_PORT PANEL_PORT ADMIN_PORT
 
 say()  { printf "\033[36m▸\033[0m %s\n" "$*"; }
 ok()   { printf "\033[32m✓\033[0m %s\n" "$*"; }
@@ -59,9 +73,36 @@ else
   ok "caddy installed"
 fi
 
-say "Enabling caddy systemd service"
-sudo systemctl enable --now caddy
-ok "caddy service enabled and running"
+if [[ "$INSTANCE_NAME" == "default" ]]; then
+  say "Enabling caddy systemd service"
+  sudo systemctl enable --now caddy
+  ok "caddy service enabled and running"
+else
+  # Named instance: run a dedicated Caddy off this repo's Caddyfile with a
+  # distinct admin port, so it doesn't fight the default instance over
+  # /etc/caddy/Caddyfile or the localhost:2019 admin endpoint.
+  CADDY_UNIT="/etc/systemd/system/caddy-$INSTANCE_NAME.service"
+  CADDY_BIN="$(command -v caddy)"
+  say "Writing ${CADDY_UNIT} (sudo)"
+  sudo tee "$CADDY_UNIT" >/dev/null <<EOF
+[Unit]
+Description=caddy (routing instance ${INSTANCE_NAME})
+After=network.target
+
+[Service]
+User=${USER}
+ExecStart=${CADDY_BIN} run --config ${ROOT}/Caddyfile --adapter caddyfile
+ExecReload=${CADDY_BIN} reload --config ${ROOT}/Caddyfile --adapter caddyfile --address localhost:${ADMIN_PORT}
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  sudo systemctl daemon-reload
+  sudo systemctl enable "caddy-$INSTANCE_NAME" >/dev/null
+  ok "caddy-$INSTANCE_NAME service installed (started after routes are applied)"
+fi
 
 # --- tailscale -------------------------------------------------------------
 if command -v tailscale >/dev/null 2>&1; then
@@ -86,19 +127,19 @@ ok "Routes applied"
 # --- control panel ---------------------------------------------------------
 # Ask for a panel auth token if one wasn't provided via the environment.
 if [[ -z "${PANEL_TOKEN:-}" ]]; then
-  printf "\033[36m▸\033[0m Enter a PANEL_TOKEN to protect /default (leave empty for no token): "
+  printf "\033[36m▸\033[0m Enter a PANEL_TOKEN to protect %s (leave empty for no token): " "$PANEL_PATH"
   read -r PANEL_TOKEN
   export PANEL_TOKEN
 fi
 
-say "Setting up the /default control panel (scripts/install-panel.sh)"
+say "Setting up the ${PANEL_PATH} control panel (scripts/install-panel.sh)"
 "$ROOT/scripts/install-panel.sh"
 ok "Control panel set up"
 
 echo
-ok "Initialization complete."
-echo "  • Routes are live on :${PROXY_PORT:-8080} (edit routes.json + rerun scripts/apply.sh to change)"
-echo "  • Control panel: http://127.0.0.1:${PANEL_PORT:-8090}/default"
+ok "Initialization complete (instance: ${INSTANCE_NAME})."
+echo "  • Routes are live on :${PROXY_PORT} (edit routes.json + rerun scripts/apply.sh to change)"
+echo "  • Control panel: http://127.0.0.1:${PANEL_PORT}${PANEL_PATH}"
 echo
 echo "Optional next step — expose this host publicly via Tailscale Funnel:"
 echo "  scripts/funnel-on.sh   (needs 'sudo tailscale up' first if not connected)"

@@ -123,8 +123,51 @@ PANEL_TOKEN=<secret> scripts/install-panel.sh   # with auth (see warning)
 > `X-Panel-Token` header.
 
 Or run it in the foreground for a quick look:
-`python3 scripts/panel.py` (env: `PANEL_PORT`, `PANEL_BIND`,
+`python3 scripts/panel.py` (env: `PANEL_PORT`, `PANEL_BIND`, `PANEL_PATH`,
 `PANEL_TOKEN`, `ROUTES_CONFIG`).
+
+## Multiple instances on one host
+
+You can run two (or more) fully independent instances on the same machine —
+e.g. one per Linux user, each with its own projects, panel path, and Caddy.
+One knob, `INSTANCE_NAME`, names everything; ports stay explicit. **Every
+instance needs a unique `INSTANCE_NAME`, `PROXY_PORT`, `PANEL_PORT`, and
+`ADMIN_PORT`.**
+
+| Env | Default | Purpose |
+|-----|---------|---------|
+| `INSTANCE_NAME` | `default` | names the panel + caddy systemd units; default panel path |
+| `PANEL_PATH` | `/$INSTANCE_NAME` | URL prefix the panel is served at |
+| `PROXY_PORT` | `8080` | Caddy listen port |
+| `PANEL_PORT` | `8090` | panel listen port |
+| `ADMIN_PORT` | `2019` | Caddy admin API port (must differ per instance) |
+
+The **default instance is unchanged**: it uses the distro `caddy` service
+reading `/etc/caddy/Caddyfile`, the unit `routing-panel`, and the path
+`/default`. A **named** instance instead runs its own `caddy-<name>.service`
+straight off its repo's `Caddyfile` (no `/etc/caddy`, no `sudo cp`), with a
+distinct admin endpoint so the two Caddys don't clash on `localhost:2019`,
+and a `routing-panel-<name>` panel unit.
+
+Set up a second instance as another user:
+
+```sh
+# As the second user, in their own clone of this repo with their routes.json:
+INSTANCE_NAME=devb PANEL_PATH=/devb \
+PROXY_PORT=8081 PANEL_PORT=8091 ADMIN_PORT=2020 \
+./init.sh
+```
+
+That user's panel is then at `:8091/devb` directly and `:8081/devb` through
+their Caddy. Because a named instance's Caddy reloads via its admin API,
+the panel's **Apply routes** button needs no sudo (the passwordless-sudo
+note below applies only to the default instance).
+
+> **Tailscale Funnel:** a tailnet node has a single serve/funnel config, so
+> only one instance can be publicly funneled — `funnel-on.sh` maps one
+> `PROXY_PORT` and the last writer wins. Expose one instance publicly and
+> reach the others on the tailnet/localhost, or front them behind the
+> funneled one.
 
 ## Usage
 
