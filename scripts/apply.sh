@@ -15,7 +15,12 @@ OUT="$ROOT/Caddyfile"
 # (/etc/caddy/Caddyfile); any named instance runs its own caddy-<name>
 # service off this repo's Caddyfile and gets a distinct admin port.
 INSTANCE_NAME="${INSTANCE_NAME:-default}"
-PANEL_PATH="${PANEL_PATH:-/$INSTANCE_NAME}"
+# Named instances nest their panel under /<name>/default; default stays /default.
+if [[ "$INSTANCE_NAME" == "default" ]]; then
+  PANEL_PATH="${PANEL_PATH:-/default}"
+else
+  PANEL_PATH="${PANEL_PATH:-/$INSTANCE_NAME/default}"
+fi
 ADMIN_PORT="${ADMIN_PORT:-2019}"
 export PANEL_PATH ADMIN_PORT  # consumed by generate-caddyfile.py
 

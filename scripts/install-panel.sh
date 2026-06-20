@@ -13,7 +13,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PANEL_PORT="${PANEL_PORT:-8090}"
 INSTANCE_NAME="${INSTANCE_NAME:-default}"
-PANEL_PATH="${PANEL_PATH:-/$INSTANCE_NAME}"
+# Named instances nest their panel under /<name>/default; default stays /default.
+if [[ "$INSTANCE_NAME" == "default" ]]; then
+  PANEL_PATH="${PANEL_PATH:-/default}"
+else
+  PANEL_PATH="${PANEL_PATH:-/$INSTANCE_NAME/default}"
+fi
 PROXY_PORT="${PROXY_PORT:-8080}"
 ADMIN_PORT="${ADMIN_PORT:-2019}"
 # Keep the legacy unit name for the default instance; suffix named ones.

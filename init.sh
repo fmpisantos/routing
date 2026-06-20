@@ -14,7 +14,9 @@
 #   INSTANCE_NAME — instance id (default "default"). The default instance
 #                   uses the shared distro Caddy; any other name runs its
 #                   own caddy-<name> service so two instances can coexist.
-#   PANEL_PATH    — URL prefix for the panel (default /$INSTANCE_NAME)
+#   PANEL_PATH    — URL prefix for the panel. Default: /default for the
+#                   default instance, /$INSTANCE_NAME/default for a named one
+#                   (so several instances' panels can coexist behind one host).
 #   PROXY_PORT    — Caddy listen port (default 8080)
 #   PANEL_PORT    — control panel port (default 8090)
 #   ADMIN_PORT    — Caddy admin API port (default 2019; must differ per
@@ -27,7 +29,13 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Instance identity — defaulted + exported so every sub-step agrees.
 INSTANCE_NAME="${INSTANCE_NAME:-default}"
-PANEL_PATH="${PANEL_PATH:-/$INSTANCE_NAME}"
+# Named instances nest their panel under /<name>/default so several panels
+# can coexist behind one host; the default instance keeps the bare /default.
+if [[ "$INSTANCE_NAME" == "default" ]]; then
+  PANEL_PATH="${PANEL_PATH:-/default}"
+else
+  PANEL_PATH="${PANEL_PATH:-/$INSTANCE_NAME/default}"
+fi
 PROXY_PORT="${PROXY_PORT:-8080}"
 PANEL_PORT="${PANEL_PORT:-8090}"
 ADMIN_PORT="${ADMIN_PORT:-2019}"

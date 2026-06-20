@@ -137,7 +137,7 @@ instance needs a unique `INSTANCE_NAME`, `PROXY_PORT`, `PANEL_PORT`, and
 | Env | Default | Purpose |
 |-----|---------|---------|
 | `INSTANCE_NAME` | `default` | names the panel + caddy systemd units; default panel path |
-| `PANEL_PATH` | `/$INSTANCE_NAME` | URL prefix the panel is served at |
+| `PANEL_PATH` | `/default` (default instance) or `/$INSTANCE_NAME/default` (named) | URL prefix the panel is served at |
 | `PROXY_PORT` | `8080` | Caddy listen port |
 | `PANEL_PORT` | `8090` | panel listen port |
 | `ADMIN_PORT` | `2019` | Caddy admin API port (must differ per instance) |
@@ -153,21 +153,39 @@ Set up a second instance as another user:
 
 ```sh
 # As the second user, in their own clone of this repo with their routes.json:
-INSTANCE_NAME=devb PANEL_PATH=/devb \
+INSTANCE_NAME=devb \
 PROXY_PORT=8081 PANEL_PORT=8091 ADMIN_PORT=2020 \
 ./init.sh
 ```
 
-That user's panel is then at `:8091/devb` directly and `:8081/devb` through
-their Caddy. Because a named instance's Caddy reloads via its admin API,
-the panel's **Apply routes** button needs no sudo (the passwordless-sudo
-note below applies only to the default instance).
+That user's panel is then at `:8091/devb/default` directly and
+`:8081/devb/default` through their Caddy — named instances nest their panel
+under `/<name>/default` by default (override with `PANEL_PATH`). The rest of
+the instance's routes are whatever its own `routes.json` declares; they need
+**not** start with `/<name>` (that user owns their own URL space on their own
+port). Because a named instance's Caddy reloads via its admin API, the
+panel's **Apply routes** button needs no sudo (the passwordless-sudo note
+below applies only to the default instance).
 
-> **Tailscale Funnel:** a tailnet node has a single serve/funnel config, so
-> only one instance can be publicly funneled — `funnel-on.sh` maps one
-> `PROXY_PORT` and the last writer wins. Expose one instance publicly and
-> reach the others on the tailnet/localhost, or front them behind the
-> funneled one.
+### Exposing several instances behind one funnel
+
+A tailnet node has a single serve/funnel config, so `funnel-on.sh` points the
+public hostname at exactly one `PROXY_PORT` — by default the **default**
+instance's Caddy on `:8080`. To reach a named instance through that same
+public hostname, give the funneled Caddy a passthrough route to it. Add an
+entry to the **default** instance's `routes.json` and re-apply:
+
+```jsonc
+// in the default instance's routes.json
+{ "projectName": "devb", "paths": [ { "path": "/devb/*", "port": 8081 } ] }
+```
+
+Now `https://<host>.ts.net/devb/default` → default Caddy (`:8080`) → devb's
+Caddy (`:8081`) → devb's panel, and any `/devb/...` route devb declares rides
+along. This is why named panels nest under `/<name>/default`: the prefix is
+what the front Caddy keys on, and Caddy preserves it end-to-end. A devb route
+that is *not* under `/devb` stays private to `:8081` (tailnet/localhost only),
+which is the point — only what devb namespaces under `/devb` becomes public.
 
 ## Usage
 
