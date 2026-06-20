@@ -32,6 +32,10 @@ API (the /default prefix is optional when hitting the port directly):
   POST /default/api/apply                 run scripts/apply.sh (regenerate
                                           the Caddyfile from routes.json
                                           and reload Caddy)
+  GET  /default/api/redeploy              redeploy status + output (tail)
+  POST /default/api/redeploy             run scripts/redeploy.sh detached
+                                          (apply routes, then reinstall +
+                                          restart this panel service)
 
 Env:
   PANEL_PORT     listen port (default 8090)
@@ -46,6 +50,7 @@ Env:
 import json
 import os
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -469,6 +474,70 @@ def apply_tail(max_bytes=65536):
         return ""
 
 
+# --- redeploy ("Restart panel") --------------------------------------------
+# A plain subprocess can't redeploy us: redeploy.sh stops and restarts *this*
+# panel service, and systemd's cgroup kill would take any child we spawned down
+# with it (leaving the redeploy half-done, possibly with the panel stopped). So
+# we launch it as a detached transient unit — its own cgroup, via `systemd-run`
+# — which survives our restart. It runs as our own user (--uid/--gid) so the
+# files it writes keep the right ownership, and its output streams to
+# REDEPLOY_LOG, which outlives the restart so the UI can keep tailing it across
+# the brief downtime.
+REDEPLOY_SCRIPT = ROOT / "scripts" / "redeploy.sh"
+REDEPLOY_LOG = STATE_DIR / "redeploy.log"
+INSTANCE_NAME = os.environ.get("INSTANCE_NAME", "default")
+REDEPLOY_UNIT = "routing-panel-redeploy-" + slug(INSTANCE_NAME)
+
+
+def redeploy_running():
+    """True while the detached redeploy transient unit is still active."""
+    r = subprocess.run(["systemctl", "is-active", "--quiet", REDEPLOY_UNIT],
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL)
+    return r.returncode == 0
+
+
+def redeploy_panel():
+    """Launch scripts/redeploy.sh detached so it can restart this panel."""
+    if not REDEPLOY_SCRIPT.exists():
+        raise PanelError(500, f"redeploy script not found: {REDEPLOY_SCRIPT}")
+    if redeploy_running():
+        raise PanelError(409, "a redeploy is already running")
+    # Truncate + stamp the log; the detached unit appends to it (as us).
+    REDEPLOY_LOG.write_text(
+        f"--- redeploy {time.strftime('%F %T')}: launching {REDEPLOY_SCRIPT}\n")
+    redirect = (f"exec {shlex.quote(str(REDEPLOY_SCRIPT))} "
+                f">> {shlex.quote(str(REDEPLOY_LOG))} 2>&1")
+    cmd = [
+        "sudo", "-n", "systemd-run", "--collect", f"--unit={REDEPLOY_UNIT}",
+        f"--uid={os.getuid()}", f"--gid={os.getgid()}",
+        f"--setenv=HOME={Path.home()}",
+        f"--setenv=PATH={os.environ.get('PATH', '')}",
+        f"--setenv=INSTANCE_NAME={INSTANCE_NAME}",
+        "/bin/bash", "-c", redirect,
+    ]
+    # systemd-run returns as soon as the unit has started; capture its own
+    # messages (e.g. a sudo/permission failure) into the same log.
+    with open(REDEPLOY_LOG, "ab") as log:
+        proc = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=log,
+                              stderr=subprocess.STDOUT)
+    if proc.returncode != 0:
+        raise PanelError(500, "failed to launch redeploy — is passwordless sudo "
+                              "for systemd-run set up? (see the README); "
+                              "details in the redeploy output")
+    return {"ok": True, "detail": "redeploy started"}
+
+
+def redeploy_tail(max_bytes=65536):
+    try:
+        with open(REDEPLOY_LOG, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - max_bytes))
+            return f.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
 PAGE = """<!doctype html>
 <html lang="en">
 <head>
@@ -510,7 +579,8 @@ button:hover:enabled{border-color:var(--accent)}
 button.stop:hover:enabled{border-color:var(--red);color:var(--red)}
 button:disabled{opacity:.45;cursor:default}
 details{margin-top:12px;font-size:12px}
-#applybox{margin:4px 28px 0;padding:0}
+#applybox,#redeploybox{margin:4px 28px 0;padding:0}
+#redeploy:hover:enabled{border-color:var(--red);color:var(--red)}
 summary{color:var(--dim);cursor:pointer;user-select:none}
 pre{background:#0b0d11;border:1px solid var(--line);border-radius:6px;
     padding:8px 10px;max-height:240px;overflow:auto;white-space:pre-wrap;
@@ -539,17 +609,18 @@ pre{background:#0b0d11;border:1px solid var(--line);border-radius:6px;
 <body>
 <header><h1>Projects</h1>
 <button id="apply" title="regenerate the Caddyfile from routes.json and reload Caddy">Apply routes</button>
+<button id="redeploy" title="redeploy the stack and restart this panel: apply routes, then reinstall + restart the panel service so it runs the latest code">Restart panel</button>
 <span id="updated"></span></header>
 <div id="err"></div>
 <details id="applybox"><summary>apply output</summary><pre id="applylog">…</pre></details>
+<details id="redeploybox"><summary>redeploy output</summary><pre id="redeploylog">…</pre></details>
 <main id="grid"></main>
 <script>
 const TKEY = 'routing-panel-token';
 const busy = new Set();
-const openLogs = new Set();
 const logFull = new Set();     // projects showing the full log (vs. the tail)
 const logLoading = new Set();  // in-flight log fetches, so polls don't pile up
-const openEnv = new Set();
+const cards = {};              // projectName -> its <div class="card">, kept across refreshes
 let last = [];
 
 function authHeaders() {
@@ -577,7 +648,10 @@ function showErr(msg) { document.getElementById('err').textContent = msg; }
 
 async function act(name, what) {
   busy.add(name);
-  if (what === 'update') openLogs.add(name);  // surface progress as it streams
+  if (what === 'update') {  // surface progress as it streams
+    const det = cards[name] && cards[name].querySelector('.logbox');
+    if (det && !det.open) det.open = true;  // toggle handler starts the live tail
+  }
   render(last);
   try {
     const r = await api('api/projects/' + encodeURIComponent(name) + '/' + what, {method: 'POST'});
@@ -679,93 +753,134 @@ async function loadLog(name, card) {
                         (full ? '?full=1' : ''));
     if (!r || !r.ok) return;
     const text = await r.text();
-    // keep the user's place if they scrolled up to read; follow only at bottom
-    const atBottom = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 24;
-    pre.textContent = text || '(no output captured yet)';
+    const display = text || '(no output captured yet)';
+    // Only touch the DOM when the text actually changed. Rewriting it every
+    // poll would drop the user's selection (so they can't copy) and flicker.
+    if (pre._shown !== display) {
+      // keep the user's place if they scrolled up to read; follow only at bottom
+      const atBottom = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 24;
+      pre._shown = display;
+      pre.textContent = display;
+      if (atBottom) pre.scrollTop = pre.scrollHeight;
+    }
     const note = card.querySelector('.logbox .lognote');
     if (note) note.textContent =
       (text ? Math.ceil(text.length / 1024) + ' KB' : '0 KB') +
       (full ? ' · full' : ' · tail');
-    if (atBottom) pre.scrollTop = pre.scrollHeight;
   } finally {
     logLoading.delete(name);
   }
 }
 
+function rowHTML(pt) {
+  return '<tr><td><span class="dot' + (pt.listening ? ' on' : '') + '"></span>' +
+    esc(pt.path) + '</td>' +
+    '<td class="mono">:' + pt.port + '</td>' +
+    '<td class="mono st">' +
+    (pt.listening ? '<span class="on-text">listening</span>' : 'down') +
+    '</td></tr>';
+}
+
+function setTitle(el, t) { t ? el.setAttribute('title', t) : el.removeAttribute('title'); }
+
+// Build a card's static skeleton once, wiring its event handlers. The dynamic
+// bits (status, badge, button states) are filled in later by updateCard().
+function makeCard(name) {
+  const card = document.createElement('div');
+  card.className = 'card';
+  card.dataset.name = name;
+  card.innerHTML =
+    '<div class="head"><h2>' + esc(name) + '</h2>' +
+    '<span class="badge"></span></div>' +
+    '<table></table>' +
+    '<div class="actions">' +
+    '<button class="start">Start</button>' +
+    '<button class="stop">Stop</button>' +
+    '<button class="update">Update &amp; Restart</button>' +
+    '</div>' +
+    '<details class="envbox"><summary></summary><div class="env">' +
+    '<table class="rows"></table>' +
+    '<div class="foot">' +
+    '<button class="addvar">+ variable</button>' +
+    '<button class="savevar">Save</button>' +
+    '<span class="savestate"></span>' +
+    '<span class="note">applied on next start / restart</span>' +
+    '</div></div></details>' +
+    '<details class="logbox"><summary>launch log</summary>' +
+    '<div class="logbar">' +
+    '<label><input type="checkbox" class="logfull"> full log</label>' +
+    '<span class="live">● live</span>' +
+    '<span class="lognote"></span>' +
+    '</div><pre>…</pre></details>';
+
+  card.querySelector('.start').onclick = () => act(name, 'start');
+  card.querySelector('.stop').onclick = () => act(name, 'stop');
+  card.querySelector('.update').onclick = () => act(name, 'update');
+
+  const env = card.querySelector('.envbox');
+  env.addEventListener('toggle', () => { if (env.open) loadEnv(name, card); });
+  card.querySelector('.addvar').onclick = () => {
+    addEnvRow(card, '', ''); markEnvDirty(name, card);
+  };
+  card.querySelector('.savevar').onclick = () => saveEnv(name, card);
+
+  const det = card.querySelector('.logbox');
+  det.addEventListener('toggle', () => { if (det.open) loadLog(name, card); });
+  card.querySelector('.logfull').onchange = e => {
+    e.target.checked ? logFull.add(name) : logFull.delete(name);
+    loadLog(name, card);
+  };
+  return card;
+}
+
+// Update only the parts of a card that change between polls. Rebuilding the
+// whole card every few seconds (as we used to) tore down the log <pre> and env
+// inputs each tick — that's what made the text flash and impossible to copy.
+function updateCard(card, p) {
+  const isBusy = busy.has(p.projectName) || p.updating;
+
+  const badge = card.querySelector('.badge');
+  badge.className = 'badge ' + p.state;
+  badge.textContent = p.updating ? 'updating…' : isBusy ? 'working…' : p.state;
+
+  const table = card.querySelector('table');
+  const sig = p.ports.map(pt => pt.path + '@' + pt.port).join('|');
+  if (table.dataset.sig !== sig) {  // ports changed shape: rebuild the rows
+    table.dataset.sig = sig;
+    table.innerHTML = p.ports.map(rowHTML).join('');
+  } else {                          // same ports: update listening state in place
+    const trs = table.querySelectorAll('tr');
+    p.ports.forEach((pt, i) => {
+      trs[i].querySelector('.dot').className = 'dot' + (pt.listening ? ' on' : '');
+      trs[i].querySelector('.st').innerHTML =
+        pt.listening ? '<span class="on-text">listening</span>' : 'down';
+    });
+  }
+
+  const startBtn = card.querySelector('.start');
+  startBtn.disabled = !p.canLaunch || p.state === 'running' || isBusy;
+  setTitle(startBtn, p.canLaunch ? '' : 'no launchScript configured');
+  card.querySelector('.stop').disabled = (p.state === 'stopped' && !p.managed) || isBusy;
+  const updBtn = card.querySelector('.update');
+  updBtn.disabled = !p.canUpdate || isBusy;
+  setTitle(updBtn, p.canUpdate ? '' : 'needs launchScript and appPath');
+
+  card.querySelector('.envbox > summary').textContent =
+    'environment' + (p.envCount ? ' (' + p.envCount + ')' : '');
+}
+
 function render(projects) {
   last = projects;
   const grid = document.getElementById('grid');
-  grid.innerHTML = '';
+  const seen = new Set();
   for (const p of projects) {
-    const card = document.createElement('div');
-    card.className = 'card';
-    card.dataset.name = p.projectName;
-    const rows = p.ports.map(pt =>
-      '<tr><td><span class="dot ' + (pt.listening ? 'on' : '') + '"></span>' + esc(pt.path) + '</td>' +
-      '<td class="mono">:' + pt.port + '</td>' +
-      '<td class="mono">' + (pt.listening ? '<span class="on-text">listening</span>' : 'down') + '</td></tr>'
-    ).join('');
-    const isBusy = busy.has(p.projectName) || p.updating;
-    const startOff = !p.canLaunch || p.state === 'running' || isBusy;
-    const stopOff = (p.state === 'stopped' && !p.managed) || isBusy;
-    const updateOff = !p.canUpdate || isBusy;
-    const badge = p.updating ? 'updating…' : isBusy ? 'working…' : p.state;
-    card.innerHTML =
-      '<div class="head"><h2>' + esc(p.projectName) + '</h2>' +
-      '<span class="badge ' + p.state + '">' + badge + '</span></div>' +
-      '<table>' + rows + '</table>' +
-      '<div class="actions">' +
-      '<button class="start"' + (startOff ? ' disabled' : '') +
-      (p.canLaunch ? '' : ' title="no launchScript configured"') + '>Start</button>' +
-      '<button class="stop"' + (stopOff ? ' disabled' : '') + '>Stop</button>' +
-      '<button class="update"' + (updateOff ? ' disabled' : '') +
-      (p.canUpdate ? '' : ' title="needs launchScript and appPath"') +
-      '>Update &amp; Restart</button>' +
-      '</div>' +
-      '<details class="envbox"' + (openEnv.has(p.projectName) ? ' open' : '') +
-      '><summary>environment' + (p.envCount ? ' (' + p.envCount + ')' : '') +
-      '</summary><div class="env">' +
-      '<table class="rows"></table>' +
-      '<div class="foot">' +
-      '<button class="addvar">+ variable</button>' +
-      '<button class="savevar">Save</button>' +
-      '<span class="savestate"></span>' +
-      '<span class="note">applied on next start / restart</span>' +
-      '</div></div></details>' +
-      '<details class="logbox"' + (openLogs.has(p.projectName) ? ' open' : '') +
-      '><summary>launch log</summary>' +
-      '<div class="logbar">' +
-      '<label><input type="checkbox" class="logfull"' +
-      (logFull.has(p.projectName) ? ' checked' : '') + '> full log</label>' +
-      '<span class="live">● live</span>' +
-      '<span class="lognote"></span>' +
-      '</div><pre>…</pre></details>';
-    card.querySelector('.start').onclick = () => act(p.projectName, 'start');
-    card.querySelector('.stop').onclick = () => act(p.projectName, 'stop');
-    card.querySelector('.update').onclick = () => act(p.projectName, 'update');
-
-    const env = card.querySelector('.envbox');
-    env.addEventListener('toggle', () => {
-      env.open ? openEnv.add(p.projectName) : openEnv.delete(p.projectName);
-      if (env.open) loadEnv(p.projectName, card);
-    });
-    card.querySelector('.addvar').onclick = () => {
-      addEnvRow(card, '', ''); markEnvDirty(p.projectName, card);
-    };
-    card.querySelector('.savevar').onclick = () => saveEnv(p.projectName, card);
-    if (env.open) loadEnv(p.projectName, card);
-
-    const det = card.querySelector('.logbox');
-    det.addEventListener('toggle', () => {
-      det.open ? openLogs.add(p.projectName) : openLogs.delete(p.projectName);
-      if (det.open) loadLog(p.projectName, card);
-    });
-    card.querySelector('.logfull').onchange = e => {
-      e.target.checked ? logFull.add(p.projectName) : logFull.delete(p.projectName);
-      loadLog(p.projectName, card);
-    };
-    if (det.open) loadLog(p.projectName, card);
-    grid.appendChild(card);
+    seen.add(p.projectName);
+    let card = cards[p.projectName];
+    if (!card) { card = cards[p.projectName] = makeCard(p.projectName); grid.appendChild(card); }
+    updateCard(card, p);
+  }
+  for (const name of Object.keys(cards)) {  // drop projects no longer in the config
+    if (!seen.has(name)) { cards[name].remove(); delete cards[name]; }
   }
 }
 
@@ -799,8 +914,12 @@ async function showApply(open) {
   if (!r || !r.ok) return;
   const d = await r.json();
   const pre = document.getElementById('applylog');
-  pre.textContent = d.log || '(no apply has run yet)';
-  pre.scrollTop = pre.scrollHeight;
+  const display = d.log || '(no apply has run yet)';
+  if (pre._shown !== display) {  // only rewrite when changed, to keep selection
+    pre._shown = display;
+    pre.textContent = display;
+    pre.scrollTop = pre.scrollHeight;
+  }
   applyBusy = d.applying;
   setApplyBtn();
   if (open) document.getElementById('applybox').open = true;
@@ -825,17 +944,75 @@ document.getElementById('applybox').addEventListener('toggle', e => {
   if (e.target.open) showApply(false);
 });
 
+// --- redeploy ("Restart panel") --------------------------------------------
+// redeploy.sh stops, reinstalls and restarts this panel, so the dashboard
+// briefly disconnects mid-run. The output log lives server-side and survives
+// the restart, so we just keep polling through the downtime (fetch errors are
+// expected) until the redeploy unit reports it has finished.
+let redeployBusy = false;
+
+function setRedeployBtn() {
+  const b = document.getElementById('redeploy');
+  b.disabled = redeployBusy;
+  b.textContent = redeployBusy ? 'Restarting…' : 'Restart panel';
+}
+
+async function showRedeploy(open) {
+  let d;
+  try {
+    const r = await api('api/redeploy');
+    if (!r || !r.ok) return;
+    d = await r.json();
+  } catch (e) {
+    // panel is unreachable mid-restart — that's expected; keep polling
+    if (redeployBusy) setTimeout(() => showRedeploy(false), 1000);
+    return;
+  }
+  const pre = document.getElementById('redeploylog');
+  const display = d.log || '(no redeploy has run yet)';
+  if (pre._shown !== display) {
+    pre._shown = display; pre.textContent = display; pre.scrollTop = pre.scrollHeight;
+  }
+  redeployBusy = d.redeploying;
+  setRedeployBtn();
+  if (open) document.getElementById('redeploybox').open = true;
+  if (d.redeploying) setTimeout(() => showRedeploy(false), 1000);
+}
+
+async function redeploy() {
+  if (!confirm('Restart the panel?\\n\\nThis runs redeploy.sh (apply routes, then ' +
+               'reinstall + restart the panel service). The dashboard will ' +
+               'disconnect for a few seconds while it comes back up.')) return;
+  redeployBusy = true;
+  setRedeployBtn();
+  document.getElementById('redeploybox').open = true;
+  try {
+    const r = await api('api/redeploy', {method: 'POST'});
+    const d = await r.json().catch(() => ({}));
+    showErr(r.ok ? '' : (d.error || ('redeploy failed (' + r.status + ')')));
+  } catch (e) {
+    showErr(String(e));
+  }
+  showRedeploy(true);  // reveal output and poll until it finishes (across the restart)
+}
+
+document.getElementById('redeploy').onclick = redeploy;
+document.getElementById('redeploybox').addEventListener('toggle', e => {
+  if (e.target.open) showRedeploy(false);
+});
+
 // Live tail: refresh any open log between the slower full-grid refreshes,
 // updating just its <pre> so the view doesn't flicker or lose scroll.
 function pollLogs() {
-  if (!openLogs.size) return;
-  for (const card of document.querySelectorAll('#grid .card')) {
-    if (openLogs.has(card.dataset.name)) loadLog(card.dataset.name, card);
+  for (const name in cards) {
+    const det = cards[name].querySelector('.logbox');
+    if (det && det.open) loadLog(name, cards[name]);
   }
 }
 
 refresh();
-showApply(false);  // sync button state in case an apply is already running
+showApply(false);     // sync button state in case an apply is already running
+showRedeploy(false);  // and in case a redeploy is still finishing after a restart
 setInterval(refresh, 3000);
 setInterval(pollLogs, 1500);
 </script>
@@ -900,6 +1077,12 @@ class Handler(BaseHTTPRequestHandler):
                         running = applying
                     return self._send(200, {"applying": running,
                                             "log": apply_tail()})
+            if path == "/api/redeploy":
+                if method == "POST":
+                    return self._send(200, redeploy_panel())
+                if method == "GET":
+                    return self._send(200, {"redeploying": redeploy_running(),
+                                            "log": redeploy_tail()})
             m = re.fullmatch(r"/api/projects/([^/]+)/(log|env|start|stop|update)", path)
             if m:
                 name, action = unquote(m.group(1)), m.group(2)

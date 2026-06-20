@@ -110,6 +110,35 @@ is a reserved prefix and cannot be used in `routes.json`.
 > Without this, the button still works but the apply output shows a
 > `sudo: a password is required` error instead of reloading Caddy.
 
+- **Restart panel** (header button) runs `scripts/redeploy.sh` so the
+  panel picks up new code without shelling in: it applies routes, then
+  reinstalls and restarts the panel service, and verifies it came back.
+  Output appears under "redeploy output". Because the script restarts the
+  panel itself, it is launched *detached* (as a `systemd-run` transient
+  unit) so it survives the restart that would otherwise kill it; the
+  dashboard disconnects for a few seconds and the log keeps streaming once
+  it reconnects.
+
+> **Passwordless sudo for Restart panel:** unlike Apply routes, a full
+> redeploy stops/starts the panel unit, rewrites `/etc/systemd/system`
+> and runs `systemd-run`, so it needs broader rights. The panel launches
+> it with `sudo -n systemd-run …`, and `redeploy.sh`/`install-panel.sh`
+> use `sudo` internally. Grant these (replace `<user>`; this is close to
+> full root — only do it on a machine you trust):
+>
+> ```sh
+> sudo tee /etc/sudoers.d/routing-panel-redeploy >/dev/null <<'EOF'
+> <user> ALL=(root) NOPASSWD: /usr/bin/systemd-run *
+> <user> ALL=(root) NOPASSWD: /usr/bin/systemctl, /usr/bin/tee /etc/systemd/system/*
+> EOF
+> sudo chmod 440 /etc/sudoers.d/routing-panel-redeploy
+> ```
+>
+> Without this, the button still works but the redeploy output shows a
+> `sudo: a password is required` error and the panel is left running its
+> current code. You can always redeploy from a terminal with
+> `scripts/redeploy.sh` instead.
+
 Install it as a systemd service:
 
 ```sh
