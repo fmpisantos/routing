@@ -40,8 +40,17 @@ if [[ "$INSTANCE_NAME" == "default" ]]; then
   # Default instance: the shared distro Caddy reads /etc/caddy/Caddyfile.
   say "Deploying to /etc/caddy/Caddyfile (sudo)"
   sudo cp "$OUT" /etc/caddy/Caddyfile
-  sudo systemctl reload-or-restart caddy
-  ok "Caddy reloaded"
+  # Try a graceful reload; if it fails — e.g. the running process's admin
+  # endpoint no longer matches the on-disk config's admin port — fall back
+  # to a full restart. Otherwise a stale admin port deadlocks every future
+  # reload ("connection refused") and apply.sh can never recover.
+  if sudo systemctl reload caddy 2>/dev/null; then
+    ok "Caddy reloaded"
+  else
+    warn "reload failed (stale admin endpoint?) — restarting caddy (sudo)"
+    sudo systemctl restart caddy
+    ok "Caddy restarted"
+  fi
 else
   # Named instance: this instance's own caddy-<name> service runs straight
   # off $OUT. Reload it via its admin API (no sudo). If the admin endpoint

@@ -45,6 +45,25 @@ if [[ ! -f "$ROOT/routes.json" ]]; then
 fi
 ok "routes.json found"
 
+# --- guard: don't let a second user hijack the shared default instance -----
+# The "default" instance owns host-global resources (/etc/caddy/Caddyfile and
+# the shared caddy + routing-panel systemd units). If routing-panel.service is
+# already owned by a different user, re-running the default here would stomp
+# their setup and take over their /default panel. Named instances are fully
+# isolated (caddy-<name>/routing-panel-<name>), so they're always allowed.
+if [[ "$INSTANCE_NAME" == "default" ]]; then
+  existing_user="$(systemctl show -p User --value routing-panel.service 2>/dev/null || true)"
+  if [[ -n "$existing_user" && "$existing_user" != "$USER" ]]; then
+    warn "The default instance is already owned by user '$existing_user'."
+    warn "Running it as '$USER' would hijack their /default panel and the"
+    warn "shared /etc/caddy/Caddyfile. Run a named instance instead, e.g.:"
+    warn "  INSTANCE_NAME=$USER PANEL_PATH=/$USER PROXY_PORT=8081 \\"
+    warn "  PANEL_PORT=8091 ADMIN_PORT=2020 ./init.sh"
+    warn "(To deliberately take over anyway, set ALLOW_DEFAULT_TAKEOVER=1.)"
+    [[ "${ALLOW_DEFAULT_TAKEOVER:-}" == "1" ]] || exit 1
+  fi
+fi
+
 if ! command -v apt-get >/dev/null 2>&1; then
   warn "This script expects a Debian/Ubuntu system (apt-get not found)."
   warn "Install manually: caddy, tailscale, python3"
