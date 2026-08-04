@@ -88,7 +88,8 @@ def load_routes(config_path, panel_path):
         if not isinstance(project, dict):
             fail(f"{where}: must be an object")
 
-        unknown = set(project) - {"projectName", "launchScript", "appPath", "paths"}
+        unknown = set(project) - {"projectName", "launchScript", "appPath",
+                                  "envFile", "paths"}
         if unknown:
             fail(f"{where}: unknown keys: {', '.join(sorted(unknown))}")
 
@@ -103,6 +104,11 @@ def load_routes(config_path, panel_path):
         launch = project.get("launchScript")
         if launch is not None and (not isinstance(launch, str) or not launch.strip()):
             fail(f"{where}: \"launchScript\" must be a non-empty string")
+
+        env_file = project.get("envFile")
+        if env_file is not None and (not isinstance(env_file, str)
+                                     or not env_file.strip()):
+            fail(f"{where}: \"envFile\" must be a non-empty string")
 
         paths = project.get("paths")
         if not isinstance(paths, list) or not paths:

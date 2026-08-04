@@ -50,6 +50,11 @@ expand). When set alongside `launchScript`, the panel's **Update &
 Restart** button stops the project, runs `git pull --rebase` there, and
 starts it again.
 
+`envFile` is optional — a path to a `.env` file whose `KEY=value` lines the
+panel loads into the project's process when it starts (`$HOME`/`~` expand; a
+relative path is resolved against `appPath`, else the repo root). See
+[Environment variables](#environment-variables).
+
 Optional per-path key:
 
 - `"strip": true` — strip the matched prefix before forwarding
@@ -78,16 +83,12 @@ is a reserved prefix and cannot be used in `routes.json`.
   then starts it again. It runs in the background and streams each step
   to the launch log; if the pull fails (e.g. local changes, conflicts)
   it stops there and does not restart.
-- **Environment** (per project, expandable) is an editable table of env
-  variables the panel injects into the project's process when it starts.
-  Add/edit/remove rows and hit **Save**; they take effect on the next
-  **Start** or **Update & Restart** (not on an already-running process).
-  Overrides are stored per project in
-  `~/.local/state/routing-panel/env.json` (chmod `600` — it may hold
-  secrets) and so survive `routes.json` regeneration. They are layered on
-  top of the panel's own environment, so a key set here wins over an
-  inherited one of the same name. The header shows a count, e.g.
-  "environment (3)".
+- **Environment** (per project, expandable) is an **env file** path plus an
+  editable table of individual variables, both injected into the project's
+  process when it starts. See [Environment variables](#environment-variables)
+  below. Changes take effect on the next **Start** or **Update & Restart**
+  (not on an already-running process). The header shows how many variables
+  the project will get, e.g. "environment (12)".
 - **Apply routes** (header button) runs `scripts/apply.sh` — regenerate
   the Caddyfile from `routes.json`, validate it, deploy it to
   `/etc/caddy` and reload Caddy — so route edits take effect without
@@ -154,6 +155,78 @@ PANEL_TOKEN=<secret> scripts/install-panel.sh   # with auth (see warning)
 Or run it in the foreground for a quick look:
 `python3 scripts/panel.py` (env: `PANEL_PORT`, `PANEL_BIND`, `PANEL_PATH`,
 `PANEL_TOKEN`, `ROUTES_CONFIG`).
+
+## Environment variables
+
+Projects the panel starts get their environment from three layers, each
+overriding the one above it:
+
+1. the panel's own environment (what the systemd unit inherits),
+2. a **`.env` file**, if the project points at one,
+3. the **inline variables** typed into the panel's environment table.
+
+So a key you type in the panel wins over the same key in the `.env` file,
+which wins over one inherited from the panel's own environment. All of it is
+applied on the next **Start** / **Update & Restart** — never to a process
+that is already running.
+
+### Pointing at a `.env` file
+
+Two places, whichever suits you:
+
+- **`routes.json`** — an `"envFile"` key on the project (versioned with the
+  rest of your config):
+
+  ```json
+  {
+      "projectName": "Flowlet",
+      "launchScript": "cd $HOME/projects/Flowlet && ./scripts/launch.sh web",
+      "appPath": "$HOME/projects/Flowlet",
+      "envFile": "$HOME/projects/Flowlet/.env",
+      "paths": [{ "path": "/*", "port": 3000 }]
+  }
+  ```
+
+- **The panel** — the "env file" box at the top of a project's
+  **environment** section. It is stored in
+  `~/.local/state/routing-panel/env-files.json` and **overrides** the
+  `routes.json` value (which shows as the box's placeholder), so you can
+  repoint a project without editing config. Clear the box to fall back to
+  `routes.json`.
+
+`$HOME`, other `$VARS` and `~` expand. A relative path is resolved against
+the project's `appPath` (so `.env` usually just works), or against this repo
+if the project has no `appPath`.
+
+Under the box the panel reports what it found — `12 variables from
+/home/you/projects/app/.env` — or the read error if the path is wrong; hover
+it to see the key names. The panel deliberately shows **names only, never
+values**: its API can be exposed via Funnel, and returning file contents
+would turn it into a way to read any file on the host. The same summary is
+written to the launch log every time the project starts.
+
+Supported file syntax — one variable per line:
+
+```sh
+# comments and blank lines are skipped
+FOO=bar
+export ALSO_FINE=yes           # an `export` prefix is allowed
+QUOTED="escapes \n work"       # double quotes: \n \t \r \\ \" \'
+LITERAL='no escapes here'      # single quotes are literal
+PLAIN=value                    # a trailing comment like this is stripped
+URL=https://example.com/a#b    # ...but only when preceded by whitespace
+```
+
+Multi-line values are not supported; a line that isn't `KEY=value` is
+ignored, and the panel says how many were (with a ⚠ on the section header).
+
+### Inline variables
+
+Add/edit/remove rows in the panel's environment table and hit **Save**. They
+are stored per project in `~/.local/state/routing-panel/env.json` (chmod
+`600` — it may hold secrets) and so survive `routes.json` regeneration. Use
+these for one-off tweaks on top of a `.env` file; keep the bulk of your
+secrets in the file.
 
 ## Multiple instances on one host
 

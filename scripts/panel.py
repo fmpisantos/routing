@@ -20,9 +20,14 @@ API (the /default prefix is optional when hitting the port directly):
   GET  /default/api/projects              status JSON
   GET  /default/api/projects/<name>/log   captured launch output (tail;
                                           ?full=1 for the full log)
-  GET  /default/api/projects/<name>/env   per-project env overrides {KEY: value}
+  GET  /default/api/projects/<name>/env   per-project env: inline overrides
+                                          {KEY: value} plus the .env file path
+                                          and the keys it defines (never their
+                                          values)
   POST /default/api/projects/<name>/env   replace the project's env overrides
-                                          (body: {"env": {KEY: value, ...}});
+                                          and/or its .env file path (body:
+                                          {"env": {KEY: value, ...},
+                                           "envFile": "path"});
                                           applied on the next start/restart
   POST /default/api/projects/<name>/start
   POST /default/api/projects/<name>/stop
@@ -73,7 +78,11 @@ STATE_DIR = Path(os.environ.get("XDG_STATE_HOME",
 LOG_DIR = STATE_DIR / "logs"
 PGID_FILE = STATE_DIR / "pgids.json"
 ENV_FILE = STATE_DIR / "env.json"
+ENV_FILES_FILE = STATE_DIR / "env-files.json"
 ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*$")
+# One `KEY=value` (or `export KEY=value`) per line in a .env file.
+ENV_LINE_RE = re.compile(r"(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)")
+ENV_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "\\": "\\", '"': '"', "'": "'"}
 APPLY_SCRIPT = ROOT / "scripts" / "apply.sh"
 APPLY_LOG = STATE_DIR / "apply.log"
 
@@ -226,6 +235,134 @@ def set_project_env_overrides(name, env):
     return clean
 
 
+# --- .env files -------------------------------------------------------------
+# A project can point at a .env file whose KEY=value lines are loaded into the
+# process it launches. The path comes from routes.json ("envFile") or, when the
+# user sets one in the panel, from env-files.json (which wins). Layering when a
+# key appears in several places:  panel's own env < .env file < inline rows.
+
+
+def load_env_file_paths():
+    """Map of projectName -> raw (unexpanded) .env path set from the panel."""
+    try:
+        data = json.loads(ENV_FILES_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def set_project_env_file(name, raw):
+    """Persist the panel-set .env path for one project ("" clears it)."""
+    if raw is None:
+        raw = ""
+    if not isinstance(raw, str):
+        raise PanelError(400, "\"envFile\" must be a string path")
+    raw = raw.strip()
+    if len(raw) > 4096:
+        raise PanelError(400, "\"envFile\" path is too long")
+    with lock:
+        data = load_env_file_paths()
+        if raw:
+            data[name] = raw
+        else:
+            data.pop(name, None)
+        ENV_FILES_FILE.write_text(json.dumps(data, indent=2))
+    return raw
+
+
+def project_env_file(project):
+    """(raw path, source) for a project — panel setting beats routes.json."""
+    override = load_env_file_paths().get(project.get("projectName", ""))
+    if isinstance(override, str) and override.strip():
+        return override.strip(), "panel"
+    configured = project.get("envFile")
+    if isinstance(configured, str) and configured.strip():
+        return configured.strip(), "routes.json"
+    return "", ""
+
+
+def resolve_env_file(project, raw):
+    """Expand a .env path; relative paths hang off appPath (else the repo)."""
+    path = Path(expand(raw))
+    if not path.is_absolute():
+        base = expand(project.get("appPath") or "") or str(ROOT)
+        path = Path(base) / path
+    return Path(os.path.normpath(path))  # tidy for display; no symlink resolve
+
+
+def unquote_env_value(value):
+    """Strip quoting from a .env value, dotenv-style."""
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        body = value[1:-1]
+        if value[0] == "'":
+            return body  # single quotes are literal
+        return re.sub(r"\\(.)",
+                      lambda m: ENV_ESCAPES.get(m.group(1), m.group(0)), body)
+    # unquoted: drop a trailing ` # comment`, as dotenv does
+    return re.split(r"\s+#", value, maxsplit=1)[0].strip()
+
+
+def parse_env_file(path):
+    """Parse a .env file into ({KEY: value}, [problems]).
+
+    One KEY=value per line; `export ` prefixes, blank lines, `#` comments and
+    quoted values are handled. Multi-line values are not supported.
+    """
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        return {}, [f"cannot read {path}: {e.strerror or e}"]
+    variables, problems = {}, []
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = ENV_LINE_RE.fullmatch(line)
+        if not m:
+            problems.append(f"line {lineno}: ignored (not KEY=value)")
+            continue
+        variables[m.group(1)] = unquote_env_value(m.group(2).strip())
+    return variables, problems
+
+
+def project_env(project):
+    """Everything about a project's environment, ready for start/report."""
+    name = project.get("projectName", "")
+    raw, source = project_env_file(project)
+    path, file_vars, problems = "", {}, []
+    if raw:
+        path = str(resolve_env_file(project, raw))
+        file_vars, problems = parse_env_file(path)
+    overrides = project_env_overrides(name)
+    return {
+        "raw": raw,            # what the user typed / routes.json holds
+        "source": source,      # "panel", "routes.json" or ""
+        "path": path,          # expanded, absolute
+        "fileVars": file_vars,
+        "problems": problems,
+        "overrides": overrides,
+        "merged": {**file_vars, **overrides},  # inline rows win
+    }
+
+
+def env_report(project):
+    """The /env API view: paths and key *names* only — never file values.
+
+    Values from the .env file are deliberately withheld so the panel can't be
+    used to read arbitrary files off the host (its API may be exposed).
+    """
+    env = project_env(project)
+    return {
+        "env": env["overrides"],
+        "envFile": load_env_file_paths().get(project.get("projectName", ""), ""),
+        "configEnvFile": project.get("envFile") or "",
+        "envFileSource": env["source"],
+        "envFilePath": env["path"],
+        "fileKeys": sorted(env["fileVars"]),
+        "fileProblems": env["problems"],
+    }
+
+
 def project_status():
     by_port = listen_inodes()
     out = []
@@ -241,6 +378,7 @@ def project_status():
         with lock:
             managed = name in pgids and group_alive(pgids[name])
             is_updating = name in updating
+        env = project_env(project)
         out.append({
             "projectName": name,
             "canLaunch": bool(project.get("launchScript")),
@@ -249,7 +387,10 @@ def project_status():
             "updating": is_updating,
             "ports": ports,
             "state": state,
-            "envCount": len(project_env_overrides(name)),
+            "envCount": len(env["merged"]),
+            "envFile": env["path"],
+            "envFileCount": len(env["fileVars"]),
+            "envFileProblem": env["problems"][0] if env["problems"] else "",
         })
     return out
 
@@ -265,14 +406,20 @@ def start_project(project):
     if ports and all(port in by_port for port in ports):
         raise PanelError(409, f"{name} is already running")
 
-    overrides = project_env_overrides(name)
-    proc_env = {**os.environ, **overrides} if overrides else None
+    env = project_env(project)
+    proc_env = {**os.environ, **env["merged"]} if env["merged"] else None
 
     log_file = LOG_DIR / f"{slug(name)}.log"
     with open(log_file, "ab") as log:
         log.write(f"\n--- start {time.strftime('%F %T')}: {script}\n".encode())
-        if overrides:
-            log.write(f"--- env overrides: {', '.join(sorted(overrides))}\n".encode())
+        if env["path"]:
+            log.write(f"--- env file ({env['source']}): {env['path']} — "
+                      f"{len(env['fileVars'])} variable(s)\n".encode())
+            for problem in env["problems"]:
+                log.write(f"--- env file: {problem}\n".encode())
+        if env["overrides"]:
+            log.write(
+                f"--- env overrides: {', '.join(sorted(env['overrides']))}\n".encode())
         proc = subprocess.Popen(
             ["bash", "-lc", script],
             cwd=str(Path.home()),
@@ -604,6 +751,11 @@ pre{background:#0b0d11;border:1px solid var(--line);border-radius:6px;
 .env .savestate{color:var(--dim);font-size:11px}
 .env .savestate.saved{color:var(--green)}
 .env .note{margin-left:auto;color:var(--dim);font-size:11px}
+.env .file{display:flex;gap:8px;align-items:center;margin:0 0 4px}
+.env .file .flabel{color:var(--dim);font-size:11px;white-space:nowrap}
+.env .efstate{color:var(--dim);font-size:11px;margin:0 0 8px;
+    font-family:ui-monospace,SFMono-Regular,monospace;word-break:break-all}
+.env .efstate.bad{color:var(--amber)}
 </style>
 </head>
 <body>
@@ -667,10 +819,11 @@ async function act(name, what) {
 }
 
 // --- per-project environment variables -------------------------------------
-// envEdit holds the in-progress rows so edits survive the 3s refresh re-render;
-// envDirty marks projects whose table has unsaved changes (don't clobber them
-// by refetching from the server).
+// envEdit/envFileEdit hold the in-progress rows and .env path so edits survive
+// the 3s refresh re-render; envDirty marks projects whose table has unsaved
+// changes (don't clobber them by refetching from the server).
 const envEdit = {};
+const envFileEdit = {};
 const envDirty = new Set();
 
 function readEnvRows(card) {
@@ -683,8 +836,32 @@ function readEnvRows(card) {
 function markEnvDirty(name, card) {
   envDirty.add(name);
   envEdit[name] = readEnvRows(card);
+  envFileEdit[name] = card.querySelector('.ef').value;
   const s = card.querySelector('.savestate');
   if (s) { s.textContent = 'unsaved'; s.className = 'savestate'; }
+}
+
+// Show where the .env file came from and what it yielded. The panel never
+// receives the file's values — only its key names — so this is a summary.
+function renderEnvFile(card, d) {
+  const input = card.querySelector('.ef');
+  const state = card.querySelector('.efstate');
+  input.placeholder = d.configEnvFile
+    ? d.configEnvFile + '  (from routes.json)'
+    : 'path to a .env file (optional)';
+  const problems = d.fileProblems || [];
+  if (!d.envFilePath) {
+    state.className = 'efstate';
+    state.textContent = '';
+    return;
+  }
+  const n = (d.fileKeys || []).length;
+  const bad = problems.some(p => p.startsWith('cannot read'));
+  state.className = 'efstate' + (bad || problems.length ? ' bad' : '');
+  state.textContent = (bad ? problems[0]
+      : n + ' variable' + (n === 1 ? '' : 's') + ' from ' + d.envFilePath +
+        (problems.length ? ' · ' + problems.length + ' line(s) ignored' : ''));
+  if ((d.fileKeys || []).length) state.title = d.fileKeys.join(', ');
 }
 
 function addEnvRow(card, k, v) {
@@ -712,28 +889,39 @@ function renderEnvRows(card, rows) {
 }
 
 async function loadEnv(name, card) {
-  if (envDirty.has(name)) { renderEnvRows(card, envEdit[name] || []); return; }
+  if (envDirty.has(name)) {
+    renderEnvRows(card, envEdit[name] || []);
+    card.querySelector('.ef').value = envFileEdit[name] || '';
+    return;
+  }
   const r = await api('api/projects/' + encodeURIComponent(name) + '/env');
   if (!r || !r.ok) return;
   const d = await r.json().catch(() => ({}));
   const rows = Object.entries(d.env || {}).map(([k, v]) => ({k, v}));
   envEdit[name] = rows;
+  envFileEdit[name] = d.envFile || '';
   renderEnvRows(card, rows);
+  card.querySelector('.ef').value = envFileEdit[name];
+  renderEnvFile(card, d);
 }
 
 async function saveEnv(name, card) {
   const env = {};
   for (const {k, v} of readEnvRows(card)) { if (k) env[k] = v; }
+  const envFile = card.querySelector('.ef').value.trim();
   const state = card.querySelector('.savestate');
   try {
     const r = await api('api/projects/' + encodeURIComponent(name) + '/env',
       {method: 'POST', headers: {'Content-Type': 'application/json'},
-       body: JSON.stringify({env})});
+       body: JSON.stringify({env, envFile})});
     const d = await r.json().catch(() => ({}));
     if (!r.ok) { showErr(d.error || ('save env failed (' + r.status + ')')); return; }
     envDirty.delete(name);
     envEdit[name] = Object.entries(d.env || {}).map(([k, v]) => ({k, v}));
+    envFileEdit[name] = d.envFile || '';
     renderEnvRows(card, envEdit[name]);
+    card.querySelector('.ef').value = envFileEdit[name];
+    renderEnvFile(card, d);
     if (state) { state.textContent = 'saved'; state.className = 'savestate saved'; }
     showErr('');
     refresh();  // refresh the (n) count in the section header
@@ -799,6 +987,10 @@ function makeCard(name) {
     '<button class="update">Update &amp; Restart</button>' +
     '</div>' +
     '<details class="envbox"><summary></summary><div class="env">' +
+    '<div class="file"><span class="flabel">env file</span>' +
+    '<input class="ef" placeholder="path to a .env file (optional)" ' +
+    'spellcheck="false"></div>' +
+    '<div class="efstate"></div>' +
     '<table class="rows"></table>' +
     '<div class="foot">' +
     '<button class="addvar">+ variable</button>' +
@@ -819,6 +1011,7 @@ function makeCard(name) {
 
   const env = card.querySelector('.envbox');
   env.addEventListener('toggle', () => { if (env.open) loadEnv(name, card); });
+  card.querySelector('.ef').oninput = () => markEnvDirty(name, card);
   card.querySelector('.addvar').onclick = () => {
     addEnvRow(card, '', ''); markEnvDirty(name, card);
   };
@@ -865,8 +1058,11 @@ function updateCard(card, p) {
   updBtn.disabled = !p.canUpdate || isBusy;
   setTitle(updBtn, p.canUpdate ? '' : 'needs launchScript and appPath');
 
-  card.querySelector('.envbox > summary').textContent =
-    'environment' + (p.envCount ? ' (' + p.envCount + ')' : '');
+  const envSum = card.querySelector('.envbox > summary');
+  envSum.textContent = 'environment' + (p.envCount ? ' (' + p.envCount + ')' : '') +
+    (p.envFileProblem ? ' ⚠' : '');
+  setTitle(envSum, p.envFileProblem ||
+    (p.envFile ? p.envFileCount + ' of them from ' + p.envFile : ''));
 }
 
 function render(projects) {
@@ -1093,12 +1289,15 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, log_tail(name, full=full).encode(),
                                       "text/plain; charset=utf-8")
                 if action == "env":
-                    find_project(name)  # 404 for unknown names
+                    project = find_project(name)  # 404 for unknown names
                     if method == "GET":
-                        return self._send(200, {"env": project_env_overrides(name)})
+                        return self._send(200, env_report(project))
                     if method == "POST":
-                        env = set_project_env_overrides(name, self._json_body().get("env", {}))
-                        return self._send(200, {"ok": True, "env": env})
+                        body = self._json_body()
+                        set_project_env_overrides(name, body.get("env", {}))
+                        if "envFile" in body:
+                            set_project_env_file(name, body["envFile"])
+                        return self._send(200, {"ok": True, **env_report(project)})
                 if method == "POST" and action == "start":
                     return self._send(200, start_project(find_project(name)))
                 if method == "POST" and action == "stop":
