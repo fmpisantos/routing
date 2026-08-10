@@ -3,6 +3,7 @@
         "projectName": "Flowlet",
         "launchScript": "$HOME/Flowlet/scripts/launch.sh",
         "appPath": "$HOME/Flowlet",
+        "launchOnStart": true,
         "paths": [
             {
                 "path": "/api/*",

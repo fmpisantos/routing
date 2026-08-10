@@ -20,9 +20,10 @@ A path ending in "/*" also covers the bare prefix: "/flowlet" is
 (and backends that only serve the slashed path still work). The
 redirect is skipped if an explicit "/flowlet" route exists.
 
-"launchScript" and "appPath" are not used here — they are read by
-scripts/panel.py, the control panel served at /default that can
-start/stop projects (and git pull --rebase in "appPath" on update). The
+"launchScript", "appPath" and "launchOnStart" are not used here — they
+are read by scripts/panel.py, the control panel served at /default that
+can start/stop projects (and git pull --rebase in "appPath" on update,
+or launch them automatically when it starts if "launchOnStart"). The
 /default prefix is reserved: a route for it (to the panel's port,
 $PANEL_PORT or 8090) is injected automatically.
 
@@ -89,7 +90,7 @@ def load_routes(config_path, panel_path):
             fail(f"{where}: must be an object")
 
         unknown = set(project) - {"projectName", "launchScript", "appPath",
-                                  "envFile", "paths"}
+                                  "envFile", "launchOnStart", "paths"}
         if unknown:
             fail(f"{where}: unknown keys: {', '.join(sorted(unknown))}")
 
@@ -109,6 +110,9 @@ def load_routes(config_path, panel_path):
         if env_file is not None and (not isinstance(env_file, str)
                                      or not env_file.strip()):
             fail(f"{where}: \"envFile\" must be a non-empty string")
+
+        if not isinstance(project.get("launchOnStart", False), bool):
+            fail(f"{where}: \"launchOnStart\" must be true or false")
 
         paths = project.get("paths")
         if not isinstance(paths, list) or not paths:

@@ -10,6 +10,12 @@ start/stop for projects that define a "launchScript":
   stop  — SIGTERMs every process group found listening on the project's
           ports (plus the group we launched, if any), SIGKILL after 5s.
 
+Projects marked `"launchOnStart": true` in routes.json are started
+automatically when the panel itself starts (i.e. on boot, since the panel
+runs as an enabled systemd service, and on a service restart), unless
+they are already listening. The panel's per-project switch writes the
+flag straight back to routes.json, so it survives a reboot.
+
 Processes are found by matching listening-socket inodes from
 /proc/net/tcp[6] against /proc/<pid>/fd, which only works for
 same-user processes — fine here, since the panel and the dev servers
@@ -29,6 +35,9 @@ API (the /default prefix is optional when hitting the port directly):
                                           {"env": {KEY: value, ...},
                                            "envFile": "path"});
                                           applied on the next start/restart
+  POST /default/api/projects/<name>/autostart  set the project's
+                                          "launchOnStart" flag in routes.json
+                                          (body: {"launchOnStart": true|false})
   POST /default/api/projects/<name>/start
   POST /default/api/projects/<name>/stop
   POST /default/api/projects/<name>/update  stop, git pull --rebase in
@@ -50,6 +59,8 @@ Env:
                  Set this if the proxy is exposed via Funnel: otherwise
                  anyone on the internet can start/stop your projects.
   ROUTES_CONFIG  path to routes.json (default: repo root)
+  PANEL_AUTOSTART_DELAY  seconds to wait before launching the
+                 "launchOnStart" projects (default 3; 0 disables the wait)
 """
 
 import json
@@ -85,6 +96,9 @@ ENV_LINE_RE = re.compile(r"(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)")
 ENV_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "\\": "\\", '"': '"', "'": "'"}
 APPLY_SCRIPT = ROOT / "scripts" / "apply.sh"
 APPLY_LOG = STATE_DIR / "apply.log"
+# Grace period before the "launchOnStart" projects are launched, so a boot
+# has a moment to settle (network, mounts, other services) first.
+AUTOSTART_DELAY = float(os.environ.get("PANEL_AUTOSTART_DELAY", "3"))
 
 lock = threading.Lock()
 pgids = {}  # projectName -> pgid of the process group we launched
@@ -115,6 +129,48 @@ def find_project(name):
         if project.get("projectName") == name:
             return project
     raise PanelError(404, f"unknown project: {name}")
+
+
+def set_project_launch_on_start(name, enabled):
+    """Write a project's "launchOnStart" flag back into routes.json.
+
+    Persisting it in the config (rather than in the panel's state dir) is the
+    point: routes.json is what a fresh panel — after a reboot or a service
+    restart — reads to decide what to launch. The file is rewritten whole
+    (json.dumps, 2-space indent) via a temp file + rename, so a crash mid-write
+    can't leave a truncated config behind. Setting the flag off drops the key
+    rather than writing `false`, keeping the config tidy.
+    """
+    if not isinstance(enabled, bool):
+        raise PanelError(400, "\"launchOnStart\" must be true or false")
+    with lock:
+        try:
+            projects = json.loads(CONFIG.read_text())
+        except OSError as e:
+            raise PanelError(500, f"cannot read {CONFIG}: {e.strerror or e}")
+        except ValueError as e:
+            raise PanelError(500, f"invalid JSON in {CONFIG}: {e}")
+        if not isinstance(projects, list):
+            raise PanelError(500, "routes.json must be a JSON array of projects")
+        for project in projects:
+            if isinstance(project, dict) and project.get("projectName") == name:
+                break
+        else:
+            raise PanelError(404, f"unknown project: {name}")
+        if enabled:
+            if not project.get("launchScript"):
+                raise PanelError(400, f"{name} has no launchScript configured")
+            project["launchOnStart"] = True
+        else:
+            project.pop("launchOnStart", None)
+        tmp = CONFIG.with_name(CONFIG.name + ".tmp")
+        try:
+            tmp.write_text(json.dumps(projects, indent=2) + "\n")
+            os.replace(tmp, CONFIG)
+        except OSError as e:
+            tmp.unlink(missing_ok=True)
+            raise PanelError(500, f"cannot write {CONFIG}: {e.strerror or e}")
+    return enabled
 
 
 def project_ports(project):
@@ -383,6 +439,7 @@ def project_status():
             "projectName": name,
             "canLaunch": bool(project.get("launchScript")),
             "canUpdate": bool(project.get("launchScript") and project.get("appPath")),
+            "launchOnStart": bool(project.get("launchOnStart")),
             "managed": managed,
             "updating": is_updating,
             "ports": ports,
@@ -434,6 +491,49 @@ def start_project(project):
         save_pgids()
     threading.Thread(target=proc.wait, daemon=True).start()  # reap on exit
     return {"ok": True, "pid": proc.pid}
+
+
+def autostart_projects():
+    """Launch every "launchOnStart" project that isn't already listening.
+
+    Called once, in a background thread, when the panel starts — which covers
+    both a reboot (the panel is an enabled systemd service) and a plain
+    service restart. A project whose ports are already served is left alone,
+    so restarting the panel never doubles up on a running project. Failures
+    are reported to the journal and to the project's own launch log; they
+    never stop the panel from coming up.
+    """
+    if AUTOSTART_DELAY > 0:
+        time.sleep(AUTOSTART_DELAY)
+    try:
+        projects = load_projects()
+    except (OSError, ValueError) as e:
+        print(f"autostart: cannot read {CONFIG}: {e}", file=sys.stderr)
+        return
+    by_port = listen_inodes()
+    for project in projects:
+        name = project.get("projectName", "?")
+        if not project.get("launchOnStart"):
+            continue
+        if not project.get("launchScript"):
+            print(f"autostart: {name}: launchOnStart set but no launchScript",
+                  file=sys.stderr)
+            continue
+        if any(port in by_port for port in project_ports(project)):
+            print(f"autostart: {name} already running — skipped", file=sys.stderr)
+            continue
+        try:
+            start_project(project)
+            print(f"autostart: started {name}", file=sys.stderr)
+        except Exception as e:
+            print(f"autostart: {name}: {e}", file=sys.stderr)
+            try:
+                with open(LOG_DIR / f"{slug(name)}.log", "ab") as log:
+                    log.write(f"--- autostart {time.strftime('%F %T')} "
+                              f"failed: {e}\n".encode())
+            except OSError:
+                pass
+        by_port = listen_inodes()  # so later projects see the ports just taken
 
 
 def stop_project(project):
@@ -725,6 +825,20 @@ button{font:inherit;font-size:13px;padding:5px 14px;border-radius:6px;
 button:hover:enabled{border-color:var(--accent)}
 button.stop:hover:enabled{border-color:var(--red);color:var(--red)}
 button:disabled{opacity:.45;cursor:default}
+.boot{display:flex;align-items:center;gap:8px;margin-top:12px;font-size:12px;
+      color:var(--dim);cursor:pointer;width:fit-content}
+.boot input{appearance:none;-webkit-appearance:none;margin:0;flex:none;
+      width:34px;height:19px;border-radius:999px;background:#212630;
+      border:1px solid var(--line);position:relative;cursor:pointer;
+      transition:background .15s,border-color .15s}
+.boot input::after{content:"";position:absolute;top:2px;left:2px;width:13px;
+      height:13px;border-radius:50%;background:var(--dim);
+      transition:transform .15s,background .15s}
+.boot input:checked{border-color:var(--green);background:rgba(63,185,80,.18)}
+.boot input:checked::after{transform:translateX(15px);background:var(--green)}
+.boot input:checked+span{color:var(--text)}
+.boot:has(input:disabled){cursor:default;opacity:.45}
+.boot input:disabled{cursor:default}
 details{margin-top:12px;font-size:12px}
 #applybox,#redeploybox{margin:4px 28px 0;padding:0}
 #redeploy:hover:enabled{border-color:var(--red);color:var(--red)}
@@ -816,6 +930,39 @@ async function act(name, what) {
   // for update, the server keeps reporting `updating` until the restart lands
   setTimeout(() => { busy.delete(name); refresh(); },
              what === 'start' || what === 'update' ? 1500 : 800);
+}
+
+// --- "start on boot" switch -------------------------------------------------
+// Writes the project's launchOnStart flag straight into routes.json, so the
+// panel launches it again after a reboot or a service restart. bootSaving
+// holds the projects with a save in flight, so the 3s refresh doesn't flip the
+// switch back to the stale server value before the write lands.
+const bootSaving = new Set();
+
+async function setAutostart(name, card, on) {
+  const chk = card.querySelector('.bootchk');
+  bootSaving.add(name);
+  chk.disabled = true;
+  try {
+    const r = await api('api/projects/' + encodeURIComponent(name) + '/autostart',
+      {method: 'POST', headers: {'Content-Type': 'application/json'},
+       body: JSON.stringify({launchOnStart: on})});
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      chk.checked = !on;  // the config wasn't written — don't pretend it was
+      showErr(d.error || ('could not save start-on-boot (' + r.status + ')'));
+    } else {
+      chk.checked = !!d.launchOnStart;
+      showErr('');
+    }
+  } catch (e) {
+    chk.checked = !on;
+    showErr(String(e));
+  } finally {
+    bootSaving.delete(name);
+    chk.disabled = false;
+    refresh();
+  }
 }
 
 // --- per-project environment variables -------------------------------------
@@ -986,6 +1133,8 @@ function makeCard(name) {
     '<button class="stop">Stop</button>' +
     '<button class="update">Update &amp; Restart</button>' +
     '</div>' +
+    '<label class="boot"><input type="checkbox" class="bootchk">' +
+    '<span>Start on boot</span></label>' +
     '<details class="envbox"><summary></summary><div class="env">' +
     '<div class="file"><span class="flabel">env file</span>' +
     '<input class="ef" placeholder="path to a .env file (optional)" ' +
@@ -1008,6 +1157,7 @@ function makeCard(name) {
   card.querySelector('.start').onclick = () => act(name, 'start');
   card.querySelector('.stop').onclick = () => act(name, 'stop');
   card.querySelector('.update').onclick = () => act(name, 'update');
+  card.querySelector('.bootchk').onchange = e => setAutostart(name, card, e.target.checked);
 
   const env = card.querySelector('.envbox');
   env.addEventListener('toggle', () => { if (env.open) loadEnv(name, card); });
@@ -1057,6 +1207,15 @@ function updateCard(card, p) {
   const updBtn = card.querySelector('.update');
   updBtn.disabled = !p.canUpdate || isBusy;
   setTitle(updBtn, p.canUpdate ? '' : 'needs launchScript and appPath');
+
+  const boot = card.querySelector('.bootchk');
+  if (!bootSaving.has(p.projectName)) {  // don't clobber a save in flight
+    boot.checked = !!p.launchOnStart;
+    boot.disabled = !p.canLaunch;
+  }
+  setTitle(boot.parentElement, p.canLaunch
+    ? 'launch this project automatically when the panel starts (written to routes.json)'
+    : 'no launchScript configured');
 
   const envSum = card.querySelector('.envbox > summary');
   envSum.textContent = 'environment' + (p.envCount ? ' (' + p.envCount + ')' : '') +
@@ -1279,7 +1438,8 @@ class Handler(BaseHTTPRequestHandler):
                 if method == "GET":
                     return self._send(200, {"redeploying": redeploy_running(),
                                             "log": redeploy_tail()})
-            m = re.fullmatch(r"/api/projects/([^/]+)/(log|env|start|stop|update)", path)
+            m = re.fullmatch(
+                r"/api/projects/([^/]+)/(log|env|autostart|start|stop|update)", path)
             if m:
                 name, action = unquote(m.group(1)), m.group(2)
                 if method == "GET" and action == "log":
@@ -1298,6 +1458,12 @@ class Handler(BaseHTTPRequestHandler):
                         if "envFile" in body:
                             set_project_env_file(name, body["envFile"])
                         return self._send(200, {"ok": True, **env_report(project)})
+                if method == "POST" and action == "autostart":
+                    find_project(name)  # 404 for unknown names
+                    body = self._json_body()
+                    value = set_project_launch_on_start(
+                        name, body.get("launchOnStart"))
+                    return self._send(200, {"ok": True, "launchOnStart": value})
                 if method == "POST" and action == "start":
                     return self._send(200, start_project(find_project(name)))
                 if method == "POST" and action == "stop":
@@ -1331,6 +1497,7 @@ def main():
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(exist_ok=True)
     load_pgids()
+    threading.Thread(target=autostart_projects, daemon=True).start()
     if not TOKEN and BIND not in ("127.0.0.1", "::1", "localhost"):
         print("warning: PANEL_TOKEN is not set and the panel is not bound to "
               "localhost — anyone who can reach it can start/stop projects",

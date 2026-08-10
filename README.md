@@ -55,6 +55,13 @@ panel loads into the project's process when it starts (`$HOME`/`~` expand; a
 relative path is resolved against `appPath`, else the repo root). See
 [Environment variables](#environment-variables).
 
+`launchOnStart` is optional (default `false`) — when `true`, the panel runs
+the project's `launchScript` as soon as the panel itself starts, i.e. on
+boot and on every panel restart. Needs a `launchScript`; a project whose
+ports are already listening is left alone, so this never starts a second
+copy. The panel's **Start on boot** switch writes this key back into
+`routes.json`, so the two are always the same setting.
+
 Optional per-path key:
 
 - `"strip": true` — strip the matched prefix before forwarding
@@ -83,6 +90,13 @@ is a reserved prefix and cannot be used in `routes.json`.
   then starts it again. It runs in the background and streams each step
   to the launch log; if the pull fails (e.g. local changes, conflicts)
   it stops there and does not restart.
+- **Start on boot** (per project, a switch) toggles `launchOnStart` in
+  `routes.json` — the file is rewritten immediately, so the choice
+  survives a reboot. On boot (the panel is an enabled systemd service) and
+  on every panel restart, each project with the switch on is started unless
+  its ports are already listening. Results go to the service journal
+  (`journalctl -u routing-panel`) and, on failure, to the project's launch
+  log. The switch is disabled for projects with no `launchScript`.
 - **Environment** (per project, expandable) is an **env file** path plus an
   editable table of individual variables, both injected into the project's
   process when it starts. See [Environment variables](#environment-variables)
