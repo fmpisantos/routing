@@ -239,7 +239,13 @@ out — and the session uses the Claude account that `claude` is logged in to
 on this host.
 
 - The card shows the session's state (`starting`, `connected`, `waiting for
-  an answer`, `exited`) and, once connected, an **open in claude.ai** link.
+  an answer`, `exited`) and, once connected, an **Open in Claude** button.
+  It links to the conversation Claude created for the folder
+  (`https://claude.ai/code/session_…`), which the Claude phone app claims: on
+  a phone with the app installed, tapping it opens the app on that
+  conversation; elsewhere it opens claude.ai. If the conversation cannot be
+  identified, the button falls back to the folder's `claude.ai/code?environment=…`
+  link, which always opens in the browser.
   The session also appears under its project name in the session list at
   claude.ai/code and in the app.
 - **claude session** (expandable) shows the session's terminal screen and the

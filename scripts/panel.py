@@ -1054,6 +1054,9 @@ CLAUDE_MAX_SESSIONS = int(os.environ.get("CLAUDE_MAX_SESSIONS") or "4")
 CLAUDE_SOCKET = "routing-claude-" + slug(INSTANCE_NAME)
 CLAUDE_UNIT = CLAUDE_SOCKET  # transient unit that holds the tmux server
 CLAUDE_URL_RE = re.compile(r"https://claude\.ai/code[^\s\"'<>]*")
+CLAUDE_ENV_RE = re.compile(r"[?&]environment=(env_[A-Za-z0-9]+)")
+CLAUDE_SESSION_ID_RE = re.compile(r"^(?:session|cse)_([A-Za-z0-9]+)$")
+CLAUDE_HOME = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
 CLAUDE_PROMPT_RE = re.compile(r"\[y/N\]|\[Y/n\]|\(y/n\)|Choose \[")
 # claude's safety check for a folder it has not been run in before
 CLAUDE_TRUST_RE = re.compile(r"Trust (/.+)\? \[y/N\]\s*$")
@@ -1087,8 +1090,40 @@ def _claude_screen(session):
     return "\n".join(lines)
 
 
+def _claude_session_url(env_url):
+    """Link to the conversation claude opened for this folder, or "".
+
+    The link on claude's screen (`/code?environment=env_…`) names the folder's
+    connection, not a conversation, and the phone apps do not claim it: tapped
+    in a phone browser it stays in the browser. `/code/session_…` is claimed
+    (claude.ai's apple-app-site-association lists `/code/*`), so it opens the
+    app on that conversation. claude records the conversation it created in
+    `<claude home>/projects/<folder>/bridge-pointer.json`; rather than rebuild
+    its folder naming, take the pointer whose environmentId is the one on
+    screen. Anything unexpected -> "", and the caller keeps the screen's link.
+    """
+    env = CLAUDE_ENV_RE.search(env_url or "")
+    if not env:
+        return ""
+    try:
+        pointers = list((CLAUDE_HOME / "projects").glob("*/bridge-pointer.json"))
+    except OSError:
+        return ""
+    for pointer in pointers:
+        try:
+            data = json.loads(pointer.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict) or data.get("environmentId") != env.group(1):
+            continue
+        sid = CLAUDE_SESSION_ID_RE.match(str(data.get("sessionId") or ""))
+        # claude.ai links use the session_ spelling of the id
+        return f"https://claude.ai/code/session_{sid.group(1)}" if sid else ""
+    return ""
+
+
 def claude_sessions(fresh=False):
-    """tmux session name -> {"state", "url", "screen"} for our sessions.
+    """tmux session name -> {"state", "url", "sessionUrl", "screen"} for ours.
 
     state: "starting"  — claude is up but hasn't connected yet
            "connected" — its screen shows the claude.ai/code link
@@ -1122,8 +1157,10 @@ def claude_sessions(fresh=False):
             else:
                 state = "starting"
             trust = CLAUDE_TRUST_RE.search(shown[-1]) if state == "waiting" else None
-            out[session] = {"state": state, "screen": screen,
-                            "url": url.group(0) if state == "connected" else "",
+            link = url.group(0) if state == "connected" else ""
+            out[session] = {"state": state, "screen": screen, "url": link,
+                            # the conversation itself; opens the phone app
+                            "sessionUrl": _claude_session_url(link),
                             # the folder claude is asking to trust, if that is
                             # the question on screen
                             "trust": trust.group(1) if trust else ""}
@@ -1153,6 +1190,7 @@ def claude_summary(project, sessions):
     s = sessions.get(claude_session_name(project.get("projectName", "")), {})
     return {"available": ok, "reason": reason,
             "state": s.get("state", "off"), "url": s.get("url", ""),
+            "sessionUrl": s.get("sessionUrl", ""),
             "trustFolder": s.get("trust", "") if _trust_pending(project, s) else ""}
 
 
@@ -1336,8 +1374,10 @@ button.ctrust{border-color:var(--amber);color:var(--amber)}
 .cstate{font-size:12px;color:var(--dim)}
 .cstate.connected{color:var(--green)}
 .cstate.waiting,.cstate.exited{color:var(--amber)}
-.clink{font-size:12px;color:var(--accent);margin-left:auto;text-decoration:none}
-.clink:hover{text-decoration:underline}
+.clink{font-size:13px;padding:5px 14px;border-radius:6px;margin-left:auto;
+       border:1px solid var(--accent);color:var(--accent);text-decoration:none;
+       white-space:nowrap}
+.clink:hover{background:var(--accent);color:#0b0d11}
 .cattach{margin:8px 0 0;color:var(--dim);font-size:11px;word-break:break-all;
     font-family:ui-monospace,SFMono-Regular,monospace;user-select:all}
 .claudebox pre{white-space:pre;max-height:300px}
@@ -1891,7 +1931,7 @@ function makeCard(name) {
     '<button class="cstop">End session</button>' +
     '<button class="ctrust" hidden>Trust this folder</button>' +
     '<span class="cstate"></span>' +
-    '<a class="clink" target="_blank" rel="noopener" hidden>open in claude.ai ↗</a>' +
+    '<a class="clink" target="_blank" rel="noopener" hidden>Open in Claude ↗</a>' +
     '</div>' +
     '<details class="claudebox"><summary>claude session</summary>' +
     '<div class="cattach"></div><pre>…</pre></details>' +
@@ -2007,8 +2047,15 @@ function updateCard(card, p) {
   cState.textContent = cBusy ? 'working…' : c.state === 'off' ? ''
     : c.state === 'waiting' ? 'waiting for an answer' : c.state;
   const cLink = card.querySelector('.clink');
-  cLink.hidden = !c.url;
-  if (c.url) cLink.href = c.url;
+  // sessionUrl is the conversation itself: the Claude phone app claims that
+  // link, so a tap opens the app there. url (the folder's connection) is the
+  // fallback, and only ever opens in the browser.
+  const cHref = c.sessionUrl || c.url;
+  cLink.hidden = !cHref;
+  if (cHref) cLink.href = cHref;
+  setTitle(cLink, c.sessionUrl
+    ? 'open this conversation: in the Claude app on a phone that has it, otherwise on claude.ai'
+    : 'open this folder on claude.ai');
 
   const envSum = card.querySelector('.envbox > summary');
   envSum.textContent = 'environment' + (p.envCount ? ' (' + p.envCount + ')' : '') +
