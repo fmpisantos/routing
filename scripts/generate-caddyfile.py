@@ -42,21 +42,32 @@ The panel path defaults to /default but is configurable (--panel-path or
 $PANEL_PATH) so two instances can coexist on one host; --admin-port
 ($ADMIN_PORT) names a distinct Caddy admin endpoint for the same reason.
 
+iPhone app: if app-association.json exists next to routes.json (see
+app-association.example.json), its app IDs are served as Apple's
+site-association file at /.well-known/apple-app-site-association. That
+is what lets the native app use this hostname's passkeys. Only the
+instance the public address points at needs it.
+
 Usage:
     generate-caddyfile.py [routes.json] [-o Caddyfile] [--listen 8080]
                           [--panel-port 8090] [--panel-path /default]
                           [--admin-port 2019]
+                          [--app-association app-association.json]
 """
 
 import argparse
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_PANEL_PATH = "/default"
 DEFAULT_ADMIN_PORT = "2019"  # Caddy's own default admin endpoint port
+# Apple fetches this exact path, without redirects, as application/json.
+APP_ASSOCIATION_PATH = "/.well-known/apple-app-site-association"
+APP_ID_RE = re.compile(r"[A-Z0-9]{10}\.[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*")
 
 
 def normalize_panel_path(path):
@@ -136,6 +147,9 @@ def load_routes(config_path, panel_path):
             if path in seen_paths:
                 fail(f"{rwhere}: duplicate path {path!r}")
             seen_paths.add(path)
+            if path == APP_ASSOCIATION_PATH:
+                fail(f"{rwhere}: {path} is reserved for the iPhone app's "
+                     "site-association file (see app-association.json)")
             if path.rstrip("*").rstrip("/") == panel_path or path.startswith(panel_path + "/"):
                 fail(f"{rwhere}: {panel_path} is reserved for the control panel")
 
@@ -151,7 +165,29 @@ def load_routes(config_path, panel_path):
     return routes
 
 
-def render(routes, listen_port, panel_port, panel_path, admin_port):
+def load_app_ids(path):
+    """App IDs ("TEAMID.bundle.id") from app-association.json; [] if absent."""
+    try:
+        data = json.loads(Path(path).read_text())
+    except FileNotFoundError:
+        return []
+    except json.JSONDecodeError as e:
+        fail(f"invalid JSON in {path}: {e}")
+    if not isinstance(data, dict) or set(data) != {"appIDs"}:
+        fail(f"{path}: must be an object with exactly one key, \"appIDs\"")
+    app_ids = data["appIDs"]
+    if not isinstance(app_ids, list) or not app_ids:
+        fail(f"{path}: \"appIDs\" must be a non-empty array")
+    for app_id in app_ids:
+        if not isinstance(app_id, str) or not APP_ID_RE.fullmatch(app_id):
+            fail(f"{path}: {app_id!r} is not an app ID — expected the "
+                 "10-character Apple Team ID, a dot, then the bundle ID "
+                 "(e.g. \"ABCDE12345.com.example.RoutingPanel\")")
+    return app_ids
+
+
+def render(routes, listen_port, panel_port, panel_path, admin_port,
+           app_ids=()):
     routes = routes + [{"path": panel_path + "/*", "port": panel_port}]
     routes = sorted(routes, key=lambda r: len(r["path"]), reverse=True)
     has_catch_all = any(r["path"] in ("/", "/*") for r in routes)
@@ -172,6 +208,18 @@ def render(routes, listen_port, panel_port, panel_path, admin_port):
         "",
         f":{listen_port} {{",
     ]
+    if app_ids:
+        # An exact path, so it wins over every route including "/*". The
+        # body is a quoted Caddyfile token: app IDs cannot contain anything
+        # that needs escaping beyond the JSON's own double quotes.
+        body = json.dumps({"webcredentials": {"apps": list(app_ids)}},
+                          separators=(",", ":")).replace('"', '\\"')
+        lines += [
+            f"\thandle {APP_ASSOCIATION_PATH} {{",
+            "\t\theader Content-Type application/json",
+            f'\t\trespond "{body}" 200',
+            "\t}",
+        ]
     all_paths = {r["path"] for r in routes}
     for route in routes:
         path, port = route["path"], route["port"]
@@ -220,11 +268,18 @@ def main():
                         help="Caddy admin API port; emitted as 'admin "
                              "localhost:<port>' so multiple instances don't "
                              "clash (default: $ADMIN_PORT or 2019)")
+    parser.add_argument("--app-association", default=None,
+                        help="JSON file listing the iPhone app's app IDs "
+                             "(default: app-association.json next to the "
+                             "config; ignored if it does not exist)")
     args = parser.parse_args()
 
     panel_path = normalize_panel_path(args.panel_path)
+    association = (args.app_association
+                   or Path(args.config).resolve().parent / "app-association.json")
     caddyfile = render(load_routes(args.config, panel_path), args.listen,
-                       args.panel_port, panel_path, args.admin_port)
+                       args.panel_port, panel_path, args.admin_port,
+                       load_app_ids(association))
     if args.output == "-":
         sys.stdout.write(caddyfile)
     else:

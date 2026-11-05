@@ -1,0 +1,4 @@
+{
+  "applying": false,
+  "log": "\u25b8 Generating Caddyfile from /home/pi/routing/routes.json\n\u2713 Generated /home/pi/routing/Caddyfile\n\u2713 Config is valid\n\u2713 Caddy reloaded\n"
+}

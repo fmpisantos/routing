@@ -1,0 +1,18 @@
+{
+  "passkeys": [
+    {
+      "id": "yR5I7g0ZVfCjXUW8PEq5g3Yq4nA",
+      "name": "iPhone",
+      "origin": "https://panel.example.ts.net",
+      "created": 1793880000,
+      "lastUsed": 1793900000
+    },
+    {
+      "id": "Qm9ndXMtY3JlZGVudGlhbC1pZA",
+      "name": "MacBook",
+      "origin": "https://panel.example.ts.net",
+      "created": 1793890000,
+      "lastUsed": null
+    }
+  ]
+}

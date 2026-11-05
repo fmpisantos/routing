@@ -1,0 +1,146 @@
+[
+  {
+    "projectName": "Flowlet",
+    "canLaunch": true,
+    "canUpdate": true,
+    "launchOnStart": false,
+    "managed": false,
+    "updating": false,
+    "ports": [
+      {
+        "path": "/api/*",
+        "port": 8000,
+        "listening": false
+      },
+      {
+        "path": "/*",
+        "port": 3000,
+        "listening": false
+      }
+    ],
+    "state": "stopped",
+    "envCount": 0,
+    "envFile": "",
+    "envFileCount": 0,
+    "envFileProblem": "",
+    "claude": {
+      "available": true,
+      "reason": "",
+      "state": "off",
+      "url": "",
+      "sessionUrl": "",
+      "trustFolder": ""
+    }
+  },
+  {
+    "projectName": "Shop API",
+    "canLaunch": true,
+    "canUpdate": true,
+    "launchOnStart": true,
+    "managed": true,
+    "updating": false,
+    "ports": [
+      {
+        "path": "/shop/api/*",
+        "port": 3003,
+        "listening": true
+      }
+    ],
+    "state": "running",
+    "envCount": 8,
+    "envFile": "/home/pi/projects/shop/.env",
+    "envFileCount": 8,
+    "envFileProblem": "",
+    "claude": {
+      "available": true,
+      "reason": "",
+      "state": "connected",
+      "url": "https://claude.ai/code?environment=env_EXAMPLE",
+      "sessionUrl": "https://claude.ai/code/session_EXAMPLE",
+      "trustFolder": ""
+    }
+  },
+  {
+    "projectName": "Importer",
+    "canLaunch": true,
+    "canUpdate": true,
+    "launchOnStart": false,
+    "managed": true,
+    "updating": true,
+    "ports": [
+      {
+        "path": "/importer/api/*",
+        "port": 3001,
+        "listening": true
+      },
+      {
+        "path": "/importer/*",
+        "port": 5173,
+        "listening": false
+      }
+    ],
+    "state": "partial",
+    "envCount": 2,
+    "envFile": "/home/pi/projects/importer/.env",
+    "envFileCount": 0,
+    "envFileProblem": "cannot read /home/pi/projects/importer/.env: No such file or directory",
+    "claude": {
+      "available": true,
+      "reason": "",
+      "state": "waiting",
+      "url": "",
+      "sessionUrl": "",
+      "trustFolder": "/home/pi/projects/importer"
+    }
+  },
+  {
+    "projectName": "other-instance",
+    "canLaunch": false,
+    "canUpdate": false,
+    "launchOnStart": false,
+    "managed": false,
+    "updating": false,
+    "ports": [
+      {
+        "path": "/other/*",
+        "port": 8081,
+        "listening": true
+      }
+    ],
+    "state": "running",
+    "envCount": 0,
+    "envFile": "",
+    "envFileCount": 0,
+    "envFileProblem": "",
+    "claude": {
+      "available": false,
+      "reason": "no appPath configured",
+      "state": "off",
+      "url": "",
+      "sessionUrl": "",
+      "trustFolder": ""
+    }
+  },
+  {
+    "projectName": "Sketchbook",
+    "canLaunch": false,
+    "canUpdate": false,
+    "launchOnStart": false,
+    "managed": false,
+    "updating": false,
+    "ports": [],
+    "state": "stopped",
+    "envCount": 0,
+    "envFile": "",
+    "envFileCount": 0,
+    "envFileProblem": "",
+    "claude": {
+      "available": true,
+      "reason": "",
+      "state": "exited",
+      "url": "",
+      "sessionUrl": "",
+      "trustFolder": ""
+    }
+  }
+]

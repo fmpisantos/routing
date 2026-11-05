@@ -1,0 +1,16 @@
+{
+  "challenge": "c2lnbi1pbi1jaGFsbGVuZ2UtZXhhbXBsZS0wMDAwMDAwMA",
+  "rpId": "panel.example.ts.net",
+  "timeout": 120000,
+  "userVerification": "required",
+  "allowCredentials": [
+    {
+      "type": "public-key",
+      "id": "yR5I7g0ZVfCjXUW8PEq5g3Yq4nA",
+      "transports": [
+        "internal",
+        "hybrid"
+      ]
+    }
+  ]
+}

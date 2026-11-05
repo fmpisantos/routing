@@ -1,0 +1,10 @@
+{
+  "available": true,
+  "reason": "",
+  "state": "connected",
+  "url": "https://claude.ai/code?environment=env_EXAMPLE",
+  "sessionUrl": "https://claude.ai/code/session_EXAMPLE",
+  "trustFolder": "",
+  "screen": "Remote Control connected\n\n  Continue coding in the Claude app or https://claude.ai/code/session_EXAMPLE\n",
+  "attach": "tmux -L routing-claude-default attach -t Shop-API"
+}

@@ -227,6 +227,31 @@ Things to know:
 - Passkey checks use the `python3-cryptography` package (`init.sh` installs
   it). Without it the panel still runs and the token still signs in.
 
+### iPhone app
+
+`ios/` holds the spec for a native iPhone app that drives the panel through
+the same API as the web page, with one **profile** per instance (`default`,
+`bruno`, …) and a passkey for each. The app is built on a Mac; see
+[`ios/README.md`](ios/README.md).
+
+For the app to use this hostname's passkeys, the hostname has to name the
+app in Apple's site-association file. Copy `app-association.example.json` to
+`app-association.json` in the repo root, put your app ID in it (Apple Team
+ID, a dot, the bundle ID) and re-apply:
+
+```sh
+cp app-association.example.json app-association.json   # then edit it
+scripts/apply.sh
+curl https://<host>.<tailnet>.ts.net/.well-known/apple-app-site-association
+```
+
+`generate-caddyfile.py` then answers that one path itself, ahead of every
+route. Only the instance the Funnel points at (normally the default one)
+needs the file; it covers every instance behind the same hostname. Apple
+fetches it from the public address, so the Funnel must be on when the app
+is installed. Passkeys you already added in Safari work in the app as they
+are, and without the file the app can still sign in with the setup token.
+
 ### Claude sessions
 
 Each project with an `appPath` has a **Claude session** button. It runs

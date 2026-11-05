@@ -1,3 +1,6 @@
 routes.json
 Caddyfile
 scripts/__pycache__/
+app-association.json
+ios/Config.xcconfig
+ios/*.xcodeproj/

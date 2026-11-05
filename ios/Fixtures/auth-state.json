@@ -1,0 +1,7 @@
+{
+  "authRequired": true,
+  "authenticated": false,
+  "passkeysSupported": true,
+  "passkeysReason": "",
+  "passkeys": 1
+}

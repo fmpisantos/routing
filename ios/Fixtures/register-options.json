@@ -1,0 +1,34 @@
+{
+  "challenge": "ZW5yb2wtY2hhbGxlbmdlLWV4YW1wbGUtMDAwMDAwMDAwMA",
+  "rp": {
+    "id": "panel.example.ts.net",
+    "name": "routing panel /default"
+  },
+  "user": {
+    "id": "c29tZS11c2VyLWlkLTAwMQ",
+    "name": "routing panel /default",
+    "displayName": "routing panel /default"
+  },
+  "pubKeyCredParams": [
+    {
+      "type": "public-key",
+      "alg": -7
+    },
+    {
+      "type": "public-key",
+      "alg": -257
+    }
+  ],
+  "timeout": 120000,
+  "attestation": "none",
+  "authenticatorSelection": {
+    "residentKey": "preferred",
+    "userVerification": "required"
+  },
+  "excludeCredentials": [
+    {
+      "type": "public-key",
+      "id": "yR5I7g0ZVfCjXUW8PEq5g3Yq4nA"
+    }
+  ]
+}
