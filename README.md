@@ -40,6 +40,11 @@ regardless of order in the file (`/flowlet/api/*` is checked before
 `/flowlet/*`). Unmatched requests get a 404, unless you define a `"/*"`
 catch-all route.
 
+`paths` may be empty (or left out) for a project that has nothing to route
+yet — that is how the panel's **New project** registers a folder. Such a
+project still gets a card (badge "no routes"), a Claude session button and,
+once you add a `launchScript`, Start/Stop.
+
 `launchScript` is optional — it is the shell command the control panel
 (below) runs to start the project (via `bash -lc`, so `$HOME` etc.
 expand). Projects without one still show status and can be stopped, but
@@ -48,7 +53,8 @@ not started.
 `appPath` is optional — the project's git working directory (`$HOME`/`~`
 expand). When set alongside `launchScript`, the panel's **Update &
 Restart** button stops the project, runs `git pull --rebase` there, and
-starts it again.
+starts it again. It is also the folder a [Claude session](#claude-sessions)
+for the project runs in.
 
 `envFile` is optional — a path to a `.env` file whose `KEY=value` lines the
 panel loads into the project's process when it starts (`$HOME`/`~` expand; a
@@ -162,13 +168,127 @@ PANEL_TOKEN=<secret> scripts/install-panel.sh   # with auth (see warning)
 ```
 
 > **Warning:** if the proxy is exposed via Funnel, `/default` is public —
-> anyone on the internet could start/stop your projects. Set
-> `PANEL_TOKEN`; the page prompts for it on first use and sends it as an
-> `X-Panel-Token` header.
+> anyone on the internet could start/stop your projects, set environment
+> variables for them and redeploy the panel. Set `PANEL_TOKEN`: the panel
+> is then locked behind a sign-in page (see [Signing in](#signing-in)).
+> To add a token to a panel that is already installed:
+> `PANEL_TOKEN=<secret> scripts/redeploy.sh` (later redeploys keep it).
+> **New project** and **Claude session** refuse to work at all (403) on a
+> panel without a token.
 
 Or run it in the foreground for a quick look:
 `python3 scripts/panel.py` (env: `PANEL_PORT`, `PANEL_BIND`, `PANEL_PATH`,
-`PANEL_TOKEN`, `ROUTES_CONFIG`).
+`PANEL_TOKEN`, `PANEL_SESSION_DAYS`, `ROUTES_CONFIG`, `PROJECTS_ROOT`,
+`CLAUDE_BIN`, `CLAUDE_PERMISSION_MODE`, `CLAUDE_MAX_SESSIONS`).
+
+### Signing in
+
+With a `PANEL_TOKEN` set, opening the panel shows a sign-in page and every
+API call is refused until you sign in. There are two ways in:
+
+- **A passkey** — Face ID or Touch ID on an iPhone or Mac, Windows Hello, an
+  Android screen lock, or a hardware security key. This is the everyday way.
+- **The setup token** — paste `PANEL_TOKEN`. Use it the first time on a new
+  device, and as the way back in if you lose your passkeys.
+
+To set a device up: sign in with the token, open **Security** (it opens by
+itself after a token sign-in) and press **Add a passkey on this device**.
+From then on the sign-in page offers **Sign in with a passkey**. An iPhone
+and a Mac on the same Apple account share one passkey through iCloud
+Keychain; a Windows PC needs its own (or can use the phone's by QR code).
+**Security** also lists the passkeys with when each was last used, removes
+them, and has **Sign out** and **Sign out everywhere**.
+
+Things to know:
+
+- **Passkeys need https and belong to one address.** They work at the
+  Funnel address (`https://<host>.<tailnet>.ts.net/default/`), which is what
+  they are tied to. Opened over plain http (a LAN or tailnet IP), the panel
+  only accepts the token.
+- **A device stays signed in for 30 days** (`PANEL_SESSION_DAYS`, kept across
+  redeploys like the other optional settings). Sessions survive panel
+  restarts.
+- **Scripts** can still send the token on each request instead of signing
+  in: `curl -H "X-Panel-Token: $TOKEN" …/default/api/projects`.
+- **Wrong tokens are throttled.** Each costs a second, and ten within ten
+  minutes pause all token use (the sign-in form and the header) for ten
+  minutes. Passkeys and devices that are already signed in are unaffected —
+  which also means someone hammering the public address can keep the token
+  paused, but cannot keep you out of a device with a passkey.
+- **Where it is stored:** passkey public keys in
+  `~/.local/state/routing-panel/passkeys.json` and session hashes in
+  `sessions.json` next to it (both mode 600). Deleting `passkeys.json`
+  removes every passkey; deleting `sessions.json` signs everyone out (restart
+  the panel after either).
+- **Other apps on the same address:** your projects are served from the same
+  hostname as the panel, so a script running in one of them can make
+  requests to the panel from a browser that is signed in. Only host projects
+  you trust.
+- Passkey checks use the `python3-cryptography` package (`init.sh` installs
+  it). Without it the panel still runs and the token still signs in.
+
+### Claude sessions
+
+Each project with an `appPath` has a **Claude session** button. It runs
+[`claude remote-control`](https://code.claude.com/docs/en/remote-control) in
+that folder, so you can work on the project from
+[claude.ai/code](https://claude.ai/code) or the Claude mobile app. Claude and
+its commands run on this host, with the project's real files; the app only
+shows the session. Nothing new is exposed to the network — the host dials
+out — and the session uses the Claude account that `claude` is logged in to
+on this host.
+
+- The card shows the session's state (`starting`, `connected`, `waiting for
+  an answer`, `exited`) and, once connected, an **open in claude.ai** link.
+  The session also appears under its project name in the session list at
+  claude.ai/code and in the app.
+- **claude session** (expandable) shows the session's terminal screen and the
+  command to attach to it over SSH, e.g.
+  `tmux -L routing-claude-default attach -t FITAUTO` (detach with
+  `Ctrl-b d`).
+- **Waiting for an answer** means Claude asked a question in its terminal
+  before connecting. The usual one is the safety check for a folder Claude
+  has not been run in before (every newly created or cloned project):
+  `Trust <folder>? [y/N]`. Read it in the box; a **Trust this folder** button
+  appears on the card and, after you confirm, answers yes for you. The panel
+  only ever answers that one question, and only when it is about the
+  project's own `appPath` — anything else is answered by attaching over SSH.
+  It is asked once per folder. Think before trusting a repository you
+  cloned: its own Claude settings (hooks, MCP servers) apply to sessions
+  there.
+- **End session** stops it. Sessions also end when the host reboots; they are
+  not restarted automatically.
+- Sessions survive a panel restart or redeploy: they run in tmux on a
+  dedicated tmux server that the panel starts as its own transient systemd
+  unit (`routing-claude-<instance>`) via `sudo -n systemd-run`. This needs
+  the same passwordless `systemd-run` rule as **Restart panel** above.
+- At most `CLAUDE_MAX_SESSIONS` (default 4) run at once. By default Claude
+  asks you to approve actions in the app; set `CLAUDE_PERMISSION_MODE`
+  (e.g. `acceptEdits`) to change that for every session. Both, and
+  `CLAUDE_BIN` if `claude` is not at `~/.local/bin/claude`, are read from
+  the environment by `install-panel.sh`/`redeploy.sh` and kept in the unit,
+  e.g. `CLAUDE_MAX_SESSIONS=2 scripts/redeploy.sh`.
+
+Needs `tmux` and a logged-in `claude` CLI for the panel's user.
+
+### New project
+
+**New project** (header button) creates a project without shelling in. Give
+it a name and, optionally, a git URL:
+
+- **No URL, new name** — makes `~/projects/<name>` and runs `git init`.
+- **No URL, folder already exists** — registers that folder as it is.
+- **Git URL** — runs `git clone` into `~/projects/<name>` (the name defaults
+  to the repository's). `https://`, `ssh://` and `git@host:owner/repo.git`
+  URLs are accepted. Private repositories work when the panel user's SSH key
+  can read them; there is nowhere to type a password or passphrase.
+
+The project is then added to `routes.json` with its `appPath` and no routes,
+so its card (and Claude session button) appears straight away. Add `paths`
+and a `launchScript` to `routes.json` later and press **Apply routes** when
+it has something to serve. Output appears under "new project"; if a clone
+fails, the half-made folder is removed. Set `PROJECTS_ROOT` to use a folder
+other than `~/projects`.
 
 ## Environment variables
 
@@ -334,7 +454,9 @@ it by hand; edit `routes.json` and re-run `scripts/apply.sh`.
 
 - `caddy` running as a systemd service (`sudo apt install caddy`)
 - `tailscale` with Funnel enabled for this host
-- `python3` (stdlib only)
+- `python3` (stdlib only, plus `python3-cryptography` for passkey sign-in)
+- `git` for **Update & Restart** and **New project**
+- `tmux` and the `claude` CLI (logged in) for **Claude session** — optional
 
 Run `./init.sh` to install all of the above (Debian/Ubuntu) and bootstrap
 `routes.json` from the example.

@@ -45,8 +45,15 @@ command -v caddy   >/dev/null             || warn "caddy CLI not found — apply
 
 # Warm the sudo credential cache up front so the run doesn't stall midway;
 # apply.sh and install-panel.sh both invoke sudo internally.
-say "Caching sudo credentials (you may be prompted)"
-sudo -v || die "sudo is required — apply.sh and install-panel.sh write to /etc and manage systemd"
+#
+# With passwordless sudo, `sudo -n true` already succeeds and there is nothing
+# to cache. `sudo -v` is only the fallback: it insists on a password whenever
+# *any* sudoers entry for the user needs one, which fails without a terminal —
+# i.e. always when the panel's "Restart panel" button launches this script.
+if ! sudo -n true 2>/dev/null; then
+  say "Caching sudo credentials (you may be prompted)"
+  sudo -v || die "sudo is required — apply.sh and install-panel.sh write to /etc and manage systemd"
+fi
 
 # --- preserve existing panel env (PANEL_TOKEN / PANEL_PORT) -----------------
 # install-panel.sh rewrites the unit from scratch and DROPS the token if
@@ -68,6 +75,13 @@ export ADMIN_PORT="${ADMIN_PORT:-$(unit_env ADMIN_PORT)}"
 export ADMIN_PORT="${ADMIN_PORT:-2019}"
 PROXY_PORT="${PROXY_PORT:-$(unit_env PROXY_PORT)}"
 export PROXY_PORT="${PROXY_PORT:-8080}"
+
+# Optional panel settings: keep whatever the current unit has (install-panel.sh
+# only writes the ones that are set).
+for var in PROJECTS_ROOT CLAUDE_BIN CLAUDE_PERMISSION_MODE CLAUDE_MAX_SESSIONS PANEL_SESSION_DAYS; do
+  value="${!var:-$(unit_env "$var")}"
+  if [[ -n "$value" ]]; then export "$var=$value"; fi
+done
 
 existing_token="$(unit_env PANEL_TOKEN)"
 if [[ -n "${PANEL_TOKEN:-}" ]]; then

@@ -91,6 +91,16 @@ else
   ok "python3 installed"
 fi
 
+# python3-cryptography: the panel verifies passkey sign-ins with it. Without
+# it the panel still runs, but only the token can sign in.
+if python3 -c "import cryptography" >/dev/null 2>&1; then
+  ok "python3-cryptography already installed"
+else
+  say "Installing python3-cryptography (passkey sign-in for the panel)"
+  sudo apt-get install -y python3-cryptography
+  ok "python3-cryptography installed"
+fi
+
 # --- caddy -----------------------------------------------------------------
 if command -v caddy >/dev/null 2>&1; then
   ok "caddy already installed ($(caddy version | cut -d' ' -f1))"

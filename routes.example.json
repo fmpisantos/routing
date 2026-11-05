@@ -14,5 +14,10 @@
                 "port": 3000
             }
         ]
+    },
+    {
+        "projectName": "Sketchbook",
+        "appPath": "$HOME/projects/Sketchbook",
+        "paths": []
     }
 ]

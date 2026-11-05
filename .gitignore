@@ -1,2 +1,3 @@
 routes.json
 Caddyfile
+scripts/__pycache__/

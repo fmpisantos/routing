@@ -50,23 +50,71 @@ API (the /default prefix is optional when hitting the port directly):
   POST /default/api/redeploy             run scripts/redeploy.sh detached
                                           (apply routes, then reinstall +
                                           restart this panel service)
+  POST /default/api/projects              create a project (body: {"name":
+                                          "x", "gitUrl": "…"}): a new folder
+                                          under $PROJECTS_ROOT with `git init`,
+                                          a `git clone` of gitUrl, or — no
+                                          gitUrl and the folder exists — that
+                                          folder as is; then add it to
+                                          routes.json with no routes
+  GET  /default/api/create                create status + output (tail)
+  GET  /default/api/projects/<name>/claude  Claude session state, its screen,
+                                          the claude.ai link and the tmux
+                                          attach command
+  POST /default/api/projects/<name>/claude  start or stop `claude
+                                          remote-control` in the project's
+                                          "appPath" (body: {"action":
+                                          "start"|"stop"}); {"action": "trust"}
+                                          answers yes when the session is
+                                          asking whether to trust that folder
+
+Creating projects and starting Claude sessions are refused (403) unless
+PANEL_TOKEN is set.
+
+Sign-in (only when PANEL_TOKEN is set; see panel_auth.py). Without a session
+GET /default/ serves a sign-in page and the API answers 401. A browser signs
+in with a passkey or by pasting the token and gets a session cookie; its
+POSTs must also carry `X-Panel-CSRF: 1`. A script may instead send the token
+as an X-Panel-Token header on every request.
+  GET  /default/api/auth/state?origin=…   signed in? passkeys usable here?
+  POST /default/api/auth/login            {"token": "…"} -> session cookie
+  POST /default/api/auth/passkey/options  {"origin": "…"} -> sign-in challenge
+  POST /default/api/auth/passkey/verify   the passkey's answer -> cookie
+  GET  /default/api/auth/passkeys         list passkeys          (signed in)
+  POST /default/api/auth/passkeys/options   start adding one     (signed in)
+  POST /default/api/auth/passkeys/register  finish adding one    (signed in)
+  POST /default/api/auth/passkeys/<id>/delete                    (signed in)
+  POST /default/api/auth/logout           {"everywhere": true} ends every
+                                          session, not just this one
 
 Env:
   PANEL_PORT     listen port (default 8090)
   PANEL_PATH     URL prefix the panel is served under (default /default)
   PANEL_BIND     bind address (default 127.0.0.1 — Caddy proxies to us)
-  PANEL_TOKEN    if set, API requests must send an X-Panel-Token header.
-                 Set this if the proxy is exposed via Funnel: otherwise
-                 anyone on the internet can start/stop your projects.
+  PANEL_TOKEN    if set, the panel requires sign-in: a passkey, or this
+                 token (pasted on the sign-in page, or sent by scripts as an
+                 X-Panel-Token header). Set this if the proxy is exposed via
+                 Funnel: otherwise anyone on the internet can start/stop your
+                 projects.
+  PANEL_SESSION_DAYS  how long a browser stays signed in (default 30)
   ROUTES_CONFIG  path to routes.json (default: repo root)
   PANEL_AUTOSTART_DELAY  seconds to wait before launching the
                  "launchOnStart" projects (default 3; 0 disables the wait)
+  PROJECTS_ROOT  where "New project" creates/clones folders (default
+                 ~/projects)
+  CLAUDE_BIN     the claude executable (default: on PATH, else
+                 ~/.local/bin/claude)
+  CLAUDE_PERMISSION_MODE  --permission-mode for Claude sessions (default:
+                 unset — Claude asks for approval in the app)
+  CLAUDE_MAX_SESSIONS  how many Claude sessions may run at once (default 4)
 """
 
+import hmac
 import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -75,6 +123,10 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
+
+# panel_auth.py lives next to this file; make it importable however we are run
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import panel_auth  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG = Path(os.environ.get("ROUTES_CONFIG", str(ROOT / "routes.json")))
@@ -104,6 +156,7 @@ lock = threading.Lock()
 pgids = {}  # projectName -> pgid of the process group we launched
 updating = set()  # projectNames currently mid update-and-restart
 applying = False  # scripts/apply.sh currently running (global, not per-project)
+creating = False  # a "New project" create/clone currently running (global)
 
 
 def expand(path):
@@ -143,15 +196,8 @@ def set_project_launch_on_start(name, enabled):
     """
     if not isinstance(enabled, bool):
         raise PanelError(400, "\"launchOnStart\" must be true or false")
-    with lock:
-        try:
-            projects = json.loads(CONFIG.read_text())
-        except OSError as e:
-            raise PanelError(500, f"cannot read {CONFIG}: {e.strerror or e}")
-        except ValueError as e:
-            raise PanelError(500, f"invalid JSON in {CONFIG}: {e}")
-        if not isinstance(projects, list):
-            raise PanelError(500, "routes.json must be a JSON array of projects")
+
+    def mutate(projects):
         for project in projects:
             if isinstance(project, dict) and project.get("projectName") == name:
                 break
@@ -163,6 +209,28 @@ def set_project_launch_on_start(name, enabled):
             project["launchOnStart"] = True
         else:
             project.pop("launchOnStart", None)
+
+    _update_config(mutate)
+    return enabled
+
+
+def _update_config(mutate):
+    """Read routes.json, let mutate(projects) edit the list in place, write it.
+
+    The whole read-modify-write runs under the lock. The file is rewritten
+    whole via a temp file + rename, so a crash mid-write can't leave a
+    truncated config behind. If mutate raises, nothing is written.
+    """
+    with lock:
+        try:
+            projects = json.loads(CONFIG.read_text())
+        except OSError as e:
+            raise PanelError(500, f"cannot read {CONFIG}: {e.strerror or e}")
+        except ValueError as e:
+            raise PanelError(500, f"invalid JSON in {CONFIG}: {e}")
+        if not isinstance(projects, list):
+            raise PanelError(500, "routes.json must be a JSON array of projects")
+        mutate(projects)
         tmp = CONFIG.with_name(CONFIG.name + ".tmp")
         try:
             tmp.write_text(json.dumps(projects, indent=2) + "\n")
@@ -170,7 +238,6 @@ def set_project_launch_on_start(name, enabled):
         except OSError as e:
             tmp.unlink(missing_ok=True)
             raise PanelError(500, f"cannot write {CONFIG}: {e.strerror or e}")
-    return enabled
 
 
 def project_ports(project):
@@ -421,6 +488,7 @@ def env_report(project):
 
 def project_status():
     by_port = listen_inodes()
+    sessions = claude_sessions()
     out = []
     for project in load_projects():
         name = project.get("projectName", "?")
@@ -448,6 +516,7 @@ def project_status():
             "envFile": env["path"],
             "envFileCount": len(env["fileVars"]),
             "envFileProblem": env["problems"][0] if env["problems"] else "",
+            "claude": claude_summary(project, sessions),
         })
     return out
 
@@ -462,6 +531,11 @@ def start_project(project):
     ports = project_ports(project)
     if ports and all(port in by_port for port in ports):
         raise PanelError(409, f"{name} is already running")
+    if not ports:  # no routes to probe: go by the process group we launched
+        with lock:
+            alive = name in pgids and group_alive(pgids[name])
+        if alive:
+            raise PanelError(409, f"{name} is already running")
 
     env = project_env(project)
     proc_env = {**os.environ, **env["merged"]} if env["merged"] else None
@@ -785,6 +859,407 @@ def redeploy_tail(max_bytes=65536):
         return ""
 
 
+def require_token(what):
+    """Refuse an action unless the panel has a token configured.
+
+    Creating/cloning projects and starting Claude sessions change what runs on
+    this host, so unlike the older endpoints they are never available on an
+    unauthenticated panel.
+    """
+    if not TOKEN:
+        raise PanelError(403, f"{what} is disabled until PANEL_TOKEN is set "
+                              "(see the README)")
+
+
+# --- sign-in ----------------------------------------------------------------
+# With a PANEL_TOKEN set the whole panel is behind a sign-in page. A browser
+# signs in with a passkey (Face ID, Touch ID, Windows Hello, a security key…)
+# or, to set up a new device and as the recovery path, by pasting the token;
+# either way it gets a session cookie. Scripts can still send the token in an
+# X-Panel-Token header on each request. The protocol work is in panel_auth.py.
+SESSION_DAYS = float(os.environ.get("PANEL_SESSION_DAYS") or "30")
+COOKIE_NAME = "routing_panel_" + re.sub(r"[^A-Za-z0-9]", "_", INSTANCE_NAME)
+auth = panel_auth.Auth(STATE_DIR, session_days=SESSION_DAYS,
+                       rp_name=f"routing panel {PANEL_PATH}")
+
+
+def check_token(given):
+    """Does `given` equal PANEL_TOKEN? Shared by the sign-in form and the
+    X-Panel-Token header, so both feed one throttle: a wrong token costs a
+    second, and too many in a row pause token use altogether (AuthError 429)
+    while passkeys and existing sessions carry on working.
+    """
+    auth.token_login_allowed()
+    # constant-time: the API may be public, don't leak the token by timing
+    if isinstance(given, str) and hmac.compare_digest(
+            given.strip().encode(), TOKEN.encode()):
+        return True
+    time.sleep(1)
+    auth.token_login_failed()
+    return False
+
+
+# --- "New project" ----------------------------------------------------------
+# Creates a project folder under PROJECTS_ROOT — empty + `git init`, cloned
+# from a git URL, or an existing folder taken as is — and registers it in
+# routes.json with an "appPath" and no routes. Runs in a background thread
+# (a clone can take a while) with its output in CREATE_LOG, like apply.
+PROJECTS_ROOT = Path(expand(os.environ.get("PROJECTS_ROOT") or "~/projects"))
+CREATE_LOG = STATE_DIR / "create.log"
+CLONE_TIMEOUT = 600  # seconds
+PROJECT_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+# https://…, ssh://… or scp-style user@host:path — nothing else (no local
+# paths, file://, ext:: or other transports), and no characters outside a
+# conservative URL set. The URL is passed to git as a single argv entry after
+# `--`, never through a shell.
+GIT_URL_RE = re.compile(
+    r"(?:(?:https|ssh)://[A-Za-z0-9]"
+    r"|[A-Za-z0-9][A-Za-z0-9._-]*@[A-Za-z0-9][A-Za-z0-9.-]*:)"
+    r"[A-Za-z0-9._~/:@%+-]*")
+
+
+def _name_from_url(url):
+    tail = re.split(r"[/:]", url.rstrip("/"))[-1]
+    return tail[:-4] if tail.endswith(".git") else tail
+
+
+def _config_path(path):
+    """Spell a path the way routes.json does: $HOME-relative when possible."""
+    try:
+        return "$HOME/" + str(path.relative_to(Path.home()))
+    except ValueError:
+        return str(path)
+
+
+def create_project(name, git_url):
+    global creating
+    require_token("creating projects")
+    if not isinstance(name, str) or not isinstance(git_url, str):
+        raise PanelError(400, "\"name\" and \"gitUrl\" must be strings")
+    name, git_url = name.strip(), git_url.strip()
+    if git_url and (len(git_url) > 512 or not GIT_URL_RE.fullmatch(git_url)):
+        raise PanelError(400, "git URL must look like https://host/path, "
+                              "ssh://host/path or git@host:owner/repo.git")
+    if not name and git_url:
+        name = _name_from_url(git_url)
+    if not PROJECT_NAME_RE.fullmatch(name):
+        raise PanelError(400, "project name must be 1-64 characters: letters, "
+                              "digits, '.', '_' or '-', starting with a letter "
+                              "or digit")
+    taken = {str(p.get("projectName", "")).lower() for p in load_projects()
+             if isinstance(p, dict)}
+    if name.lower() in taken:
+        raise PanelError(409, f"a project named {name} already exists")
+    dest = PROJECTS_ROOT / name
+    if dest.exists() and not dest.is_dir():
+        raise PanelError(409, f"{dest} exists and is not a folder")
+    if git_url and dest.exists():
+        raise PanelError(409, f"{dest} already exists — leave the git URL "
+                              "empty to register that folder as it is")
+    with lock:
+        if creating:
+            raise PanelError(409, "another project is being created")
+        creating = True
+    threading.Thread(target=_run_create, args=(name, git_url, dest),
+                     daemon=True).start()
+    return {"ok": True, "projectName": name, "detail": "create started"}
+
+
+def _run_create(name, git_url, dest):
+    global creating
+    try:
+        with open(CREATE_LOG, "wb") as log:  # truncate: keep only the latest run
+            def emit(msg):
+                log.write(f"--- create {time.strftime('%F %T')}: {msg}\n".encode())
+                log.flush()
+
+            made = False  # did this run create dest (so may it remove it)?
+            try:
+                if git_url:
+                    PROJECTS_ROOT.mkdir(parents=True, exist_ok=True)
+                    made = not dest.exists()
+                    emit(f"git clone {git_url} into {dest}")
+                    result = subprocess.run(
+                        ["git", "-c", "protocol.file.allow=never",
+                         "-c", "protocol.ext.allow=never",
+                         "clone", "--", git_url, str(dest)],
+                        stdin=subprocess.DEVNULL, stdout=log,
+                        stderr=subprocess.STDOUT, timeout=CLONE_TIMEOUT,
+                        env={**os.environ, "GIT_TERMINAL_PROMPT": "0",
+                             "GIT_SSH_COMMAND": "ssh -o BatchMode=yes "
+                                                "-o StrictHostKeyChecking=accept-new"})
+                    if result.returncode != 0:
+                        raise PanelError(
+                            500, f"git clone failed (exit {result.returncode})")
+                elif dest.is_dir():
+                    emit(f"{dest} already exists — registering it as it is")
+                else:
+                    emit(f"creating {dest}")
+                    dest.mkdir(parents=True)
+                    made = True
+                    result = subprocess.run(
+                        ["git", "init"], cwd=str(dest),
+                        stdin=subprocess.DEVNULL, stdout=log,
+                        stderr=subprocess.STDOUT, timeout=60)
+                    if result.returncode != 0:
+                        raise PanelError(
+                            500, f"git init failed (exit {result.returncode})")
+
+                def add(projects):
+                    if any(isinstance(p, dict) and
+                           str(p.get("projectName", "")).lower() == name.lower()
+                           for p in projects):
+                        raise PanelError(409, f"a project named {name} already exists")
+                    projects.append({"projectName": name,
+                                     "appPath": _config_path(dest),
+                                     "paths": []})
+
+                _update_config(add)
+                emit(f"done — {name} added to {CONFIG.name} (no routes yet)")
+            except (PanelError, OSError, subprocess.TimeoutExpired) as e:
+                if made and dest.exists():
+                    shutil.rmtree(dest, ignore_errors=True)
+                    emit(f"removed {dest}")
+                emit(f"FAILED: {e}")
+    finally:
+        with lock:
+            creating = False
+
+
+def create_tail(max_bytes=65536):
+    try:
+        with open(CREATE_LOG, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - max_bytes))
+            return f.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+# --- Claude Remote Control sessions ----------------------------------------
+# One `claude remote-control` server per project, run in the project's appPath
+# so it can be driven from claude.ai/code or the Claude mobile app. Claude runs
+# here, on this host; nothing new listens on the network (it dials out).
+#
+# Each one lives in a tmux session on a dedicated tmux server (socket
+# CLAUDE_SOCKET, apart from the user's own tmux): that gives claude the
+# terminal it expects, lets the panel read its screen (the claude.ai link, or a
+# question it is waiting on), and lets you attach over SSH. Like a redeploy,
+# the tmux server must not be our child — systemd would kill it with us on a
+# panel restart — so it is started as its own transient unit via `systemd-run`.
+CLAUDE_BIN = (os.environ.get("CLAUDE_BIN") or shutil.which("claude")
+              or str(Path.home() / ".local" / "bin" / "claude"))
+CLAUDE_PERMISSION_MODE = os.environ.get("CLAUDE_PERMISSION_MODE", "").strip()
+CLAUDE_MAX_SESSIONS = int(os.environ.get("CLAUDE_MAX_SESSIONS") or "4")
+CLAUDE_SOCKET = "routing-claude-" + slug(INSTANCE_NAME)
+CLAUDE_UNIT = CLAUDE_SOCKET  # transient unit that holds the tmux server
+CLAUDE_URL_RE = re.compile(r"https://claude\.ai/code[^\s\"'<>]*")
+CLAUDE_PROMPT_RE = re.compile(r"\[y/N\]|\[Y/n\]|\(y/n\)|Choose \[")
+# claude's safety check for a folder it has not been run in before
+CLAUDE_TRUST_RE = re.compile(r"Trust (/.+)\? \[y/N\]\s*$")
+claude_lock = threading.Lock()  # serialises session starts
+_claude_cache = (0.0, {})       # (monotonic stamp, claude_sessions() result)
+
+
+def claude_session_name(name):
+    """tmux session name for a project (tmux forbids '.' and ':' in names)."""
+    return re.sub(r"[^A-Za-z0-9_-]+", "-", name) or "project"
+
+
+def _tmux(*args):
+    try:
+        return subprocess.run(
+            ["tmux", "-u", "-L", CLAUDE_SOCKET, *args],
+            stdin=subprocess.DEVNULL, capture_output=True, timeout=10,
+            encoding="utf-8", errors="replace")
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return subprocess.CompletedProcess(args, 1, "", str(e))
+
+
+def _claude_screen(session):
+    """What the session's terminal currently shows, as plain text."""
+    r = _tmux("capture-pane", "-p", "-J", "-t", f"={session}:")
+    if r.returncode != 0:
+        return ""
+    lines = [line.rstrip() for line in r.stdout.splitlines()]
+    while lines and not lines[-1]:
+        lines.pop()
+    return "\n".join(lines)
+
+
+def claude_sessions(fresh=False):
+    """tmux session name -> {"state", "url", "screen"} for our sessions.
+
+    state: "starting"  — claude is up but hasn't connected yet
+           "connected" — its screen shows the claude.ai/code link
+           "waiting"   — it is asking a question in the terminal (e.g. whether
+                         to trust a folder it has not seen before)
+           "exited"    — claude quit; its last screen is kept for reading
+    Cached for 2s: every dashboard poll asks, and each answer costs a couple
+    of tmux calls per session.
+    """
+    global _claude_cache
+    stamp, cached = _claude_cache
+    now = time.monotonic()
+    if not fresh and now - stamp < 2:
+        return cached
+    out = {}
+    r = _tmux("list-panes", "-a", "-F", "#{session_name}\t#{pane_dead}")
+    if r.returncode == 0:  # non-zero: no tmux server, i.e. no sessions
+        for line in r.stdout.splitlines():
+            session, _, dead = line.partition("\t")
+            if not session or session in out:
+                continue
+            screen = _claude_screen(session)
+            shown = [l for l in screen.splitlines() if l.strip()]
+            url = CLAUDE_URL_RE.search(screen)
+            if dead == "1":
+                state = "exited"
+            elif shown and CLAUDE_PROMPT_RE.search(shown[-1]):
+                state = "waiting"
+            elif url:
+                state = "connected"
+            else:
+                state = "starting"
+            trust = CLAUDE_TRUST_RE.search(shown[-1]) if state == "waiting" else None
+            out[session] = {"state": state, "screen": screen,
+                            "url": url.group(0) if state == "connected" else "",
+                            # the folder claude is asking to trust, if that is
+                            # the question on screen
+                            "trust": trust.group(1) if trust else ""}
+    _claude_cache = (now, out)
+    return out
+
+
+def claude_available(project):
+    """(ok, reason): can this project host a Claude session?"""
+    if not TOKEN:
+        return False, "set PANEL_TOKEN to enable Claude sessions"
+    raw = project.get("appPath")
+    if not raw:
+        return False, "no appPath configured"
+    if not Path(expand(raw)).is_dir():
+        return False, f"appPath is not a folder: {expand(raw)}"
+    if not shutil.which("tmux"):
+        return False, "tmux is not installed"
+    if not os.access(CLAUDE_BIN, os.X_OK):
+        return False, f"claude not found at {CLAUDE_BIN} (set CLAUDE_BIN)"
+    return True, ""
+
+
+def claude_summary(project, sessions):
+    """The per-project "claude" block of the status JSON."""
+    ok, reason = claude_available(project)
+    s = sessions.get(claude_session_name(project.get("projectName", "")), {})
+    return {"available": ok, "reason": reason,
+            "state": s.get("state", "off"), "url": s.get("url", ""),
+            "trustFolder": s.get("trust", "") if _trust_pending(project, s) else ""}
+
+
+def _trust_pending(project, s):
+    """Is the session asking to trust exactly this project's own appPath?"""
+    asked, app_path = s.get("trust"), project.get("appPath")
+    return bool(asked and app_path and
+                os.path.realpath(asked) == os.path.realpath(expand(app_path)))
+
+
+def claude_trust(project):
+    """Answer yes to claude's "Trust <folder>? [y/N]" for this project.
+
+    This is the panel user's own decision, relayed: it is only sent when that
+    exact question, about this project's own appPath, is what the session is
+    showing right now. No other question is ever answered from here.
+    """
+    name = project["projectName"]
+    require_token("trusting a folder")
+    session = claude_session_name(name)
+    s = claude_sessions(fresh=True).get(session, {})
+    if not _trust_pending(project, s):
+        raise PanelError(409, f"{name}'s Claude session is not asking to trust "
+                              "its folder")
+    r = _tmux("send-keys", "-t", f"={session}:", "y", "Enter")
+    claude_sessions(fresh=True)
+    if r.returncode != 0:
+        raise PanelError(500, "could not answer the session: "
+                              + (r.stderr.strip() or f"exit {r.returncode}"))
+    return {"ok": True, "trusted": s["trust"]}
+
+
+def claude_info(project):
+    """Status plus the session's screen and how to attach to it over SSH."""
+    session = claude_session_name(project["projectName"])
+    s = claude_sessions().get(session, {})
+    return {**claude_summary(project, {session: s}),
+            "screen": s.get("screen", ""),
+            "attach": f"tmux -L {CLAUDE_SOCKET} attach -t {session}"}
+
+
+def claude_start(project):
+    name = project["projectName"]
+    require_token("starting Claude sessions")
+    ok, reason = claude_available(project)
+    if not ok:
+        raise PanelError(400, f"{name}: {reason}")
+    session = claude_session_name(name)
+    app_path = expand(project["appPath"])
+    with claude_lock:
+        sessions = claude_sessions(fresh=True)
+        if session in sessions:
+            if sessions[session]["state"] != "exited":
+                raise PanelError(409, f"{name} already has a Claude session")
+            _tmux("kill-session", "-t", "=" + session)  # clear the dead one
+            del sessions[session]
+        if len(sessions) >= CLAUDE_MAX_SESSIONS:
+            raise PanelError(409, f"{len(sessions)} Claude sessions are already "
+                                  "running (CLAUDE_MAX_SESSIONS) — end one first")
+
+        claude = [CLAUDE_BIN, "remote-control", "--name", name,
+                  # explicit, or the first run in a folder stops to ask
+                  "--spawn=same-dir"]
+        if CLAUDE_PERMISSION_MODE:
+            claude += ["--permission-mode", CLAUDE_PERMISSION_MODE]
+        inner = "exec " + " ".join(shlex.quote(a) for a in claude)
+        tmux_cmd = [
+            "tmux", "-u", "-L", CLAUDE_SOCKET,
+            "new-session", "-d", "-s", session, "-x", "200", "-y", "50",
+            "-c", app_path, "bash", "-lc", inner,
+            # keep the pane after claude exits so a failure stays readable
+            ";", "set-option", "-w", "-t", session, "remain-on-exit", "on",
+        ]
+        if _tmux("list-sessions").returncode != 0:  # no server yet: own unit
+            tmux_cmd = [
+                "sudo", "-n", "systemd-run", "--collect", "--quiet",
+                f"--unit={CLAUDE_UNIT}", "--service-type=forking",
+                f"--uid={os.getuid()}", f"--gid={os.getgid()}",
+                f"--working-directory={Path.home()}",
+                f"--setenv=HOME={Path.home()}",
+                f"--setenv=PATH={os.environ.get('PATH') or '/usr/local/bin:/usr/bin:/bin'}",
+                "--setenv=LANG=C.UTF-8",
+            ] + tmux_cmd
+        try:
+            r = subprocess.run(tmux_cmd, stdin=subprocess.DEVNULL,
+                               capture_output=True, timeout=30,
+                               encoding="utf-8", errors="replace")
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise PanelError(500, f"could not start a Claude session: {e}")
+        finally:
+            claude_sessions(fresh=True)  # drop the cached "no session" answer
+        if r.returncode != 0:
+            detail = (r.stderr or r.stdout).strip().splitlines()
+            raise PanelError(500, "could not start a Claude session: "
+                             + (detail[-1] if detail else f"exit {r.returncode}"))
+    return {"ok": True, "session": session}
+
+
+def claude_stop(project):
+    session = claude_session_name(project["projectName"])
+    r = _tmux("kill-session", "-t", "=" + session)
+    claude_sessions(fresh=True)
+    if r.returncode != 0:
+        return {"ok": True, "detail": "no session was running"}
+    return {"ok": True}
+
+
 PAGE = """<!doctype html>
 <html lang="en">
 <head>
@@ -840,7 +1315,32 @@ button:disabled{opacity:.45;cursor:default}
 .boot:has(input:disabled){cursor:default;opacity:.45}
 .boot input:disabled{cursor:default}
 details{margin-top:12px;font-size:12px}
-#applybox,#redeploybox{margin:4px 28px 0;padding:0}
+#applybox,#redeploybox,#newbox,#secbox{margin:4px 28px 0;padding:0}
+#pkhint{color:var(--dim);font-size:12px;margin:8px 0 0}
+#pk-name{flex:0 1 240px}
+#pklist{max-width:640px;margin:8px 0 0}
+#pklist td{padding:3px 12px 3px 0;color:var(--dim);font-size:12px}
+#pklist td.pkname{color:var(--text)}
+#pklist button{padding:2px 9px;font-size:12px}
+#pklist button:hover:enabled,#signout-all:hover:enabled{border-color:var(--red);color:var(--red)}
+.newform{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:8px 0}
+.newform input{font:inherit;font-size:12px;flex:1 1 220px;min-width:0;
+    font-family:ui-monospace,SFMono-Regular,monospace;padding:5px 8px;
+    border-radius:5px;border:1px solid var(--line);background:#0b0d11;
+    color:var(--text)}
+.newform input:focus{outline:none;border-color:var(--accent)}
+.newform .hint{flex:1 1 100%;color:var(--dim);font-size:11px}
+.claude{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:12px}
+button.cstop:hover:enabled{border-color:var(--red);color:var(--red)}
+button.ctrust{border-color:var(--amber);color:var(--amber)}
+.cstate{font-size:12px;color:var(--dim)}
+.cstate.connected{color:var(--green)}
+.cstate.waiting,.cstate.exited{color:var(--amber)}
+.clink{font-size:12px;color:var(--accent);margin-left:auto;text-decoration:none}
+.clink:hover{text-decoration:underline}
+.cattach{margin:8px 0 0;color:var(--dim);font-size:11px;word-break:break-all;
+    font-family:ui-monospace,SFMono-Regular,monospace;user-select:all}
+.claudebox pre{white-space:pre;max-height:300px}
 #redeploy:hover:enabled{border-color:var(--red);color:var(--red)}
 summary{color:var(--dim);cursor:pointer;user-select:none}
 pre{background:#0b0d11;border:1px solid var(--line);border-radius:6px;
@@ -876,33 +1376,48 @@ pre{background:#0b0d11;border:1px solid var(--line);border-radius:6px;
 <header><h1>Projects</h1>
 <button id="apply" title="regenerate the Caddyfile from routes.json and reload Caddy">Apply routes</button>
 <button id="redeploy" title="redeploy the stack and restart this panel: apply routes, then reinstall + restart the panel service so it runs the latest code">Restart panel</button>
+<button id="newproj" title="create a project folder (empty, or cloned from git) and add it to routes.json">New project</button>
+<button id="secbtn" title="passkeys for signing in, and sign out" hidden>Security</button>
 <span id="updated"></span></header>
 <div id="err"></div>
+<details id="secbox" hidden><summary>security</summary>
+<div id="pkhint"></div>
+<table id="pklist"></table>
+<div class="newform">
+<input id="pk-name" placeholder="name for this device's passkey" maxlength="60" spellcheck="false">
+<button id="pk-add">Add a passkey on this device</button>
+<button id="signout">Sign out</button>
+<button id="signout-all" title="end every signed-in browser session, including this one">Sign out everywhere</button>
+</div></details>
+<details id="newbox"><summary>new project</summary>
+<div class="newform">
+<input id="np-url" placeholder="git URL to clone (optional) — git@github.com:you/repo.git" spellcheck="false" autocapitalize="off">
+<input id="np-name" placeholder="project name (its folder under ~/projects)" spellcheck="false" autocapitalize="off">
+<button id="np-create">Create</button>
+<span class="hint">No URL: makes an empty folder with git init, or registers the folder if it already exists. The project is added to routes.json with no routes.</span>
+</div><pre id="createlog">…</pre></details>
 <details id="applybox"><summary>apply output</summary><pre id="applylog">…</pre></details>
 <details id="redeploybox"><summary>redeploy output</summary><pre id="redeploylog">…</pre></details>
 <main id="grid"></main>
 <script>
-const TKEY = 'routing-panel-token';
+/*AUTH_JS*/
+// The token used to live here in localStorage; sign-in is a cookie now.
+try { localStorage.removeItem('routing-panel-token'); } catch (e) {}
 const busy = new Set();
 const logFull = new Set();     // projects showing the full log (vs. the tail)
 const logLoading = new Set();  // in-flight log fetches, so polls don't pile up
 const cards = {};              // projectName -> its <div class="card">, kept across refreshes
 let last = [];
 
-function authHeaders() {
-  const t = localStorage.getItem(TKEY);
-  return t ? {'X-Panel-Token': t} : {};
-}
+// Every request rides on the session cookie. X-Panel-CSRF marks it as coming
+// from this page (another site cannot add it). A 401 means the session ended:
+// reload, and the server answers with the sign-in page.
+let signedOut = false;
 
 async function api(path, opts = {}) {
-  let r = await fetch(path, {...opts, headers: {...authHeaders(), ...(opts.headers || {})}});
-  if (r.status === 401) {
-    const t = prompt('This panel requires a token (PANEL_TOKEN):');
-    if (t) {
-      localStorage.setItem(TKEY, t);
-      r = await fetch(path, {...opts, headers: {...authHeaders(), ...(opts.headers || {})}});
-    }
-  }
+  const r = await fetch(path, {...opts,
+    headers: {'X-Panel-CSRF': '1', ...(opts.headers || {})}});
+  if (r.status === 401 && !signedOut) { signedOut = true; location.reload(); }
   return r;
 }
 
@@ -964,6 +1479,242 @@ async function setAutostart(name, card, on) {
     refresh();
   }
 }
+
+// --- Claude sessions ---------------------------------------------------------
+// Start/stop `claude remote-control` in the project's folder. The box under
+// the buttons shows the session's terminal screen — the claude.ai link once it
+// is connected, or the question it is waiting on — and the tmux command to
+// attach to it over SSH. It is polled only while open, like the launch log.
+const claudeBusy = new Set();
+const claudeLoading = new Set();
+
+async function loadClaude(name, card) {
+  if (claudeLoading.has(name)) return;
+  claudeLoading.add(name);
+  try {
+    const r = await api('api/projects/' + encodeURIComponent(name) + '/claude');
+    if (!r || !r.ok) return;
+    const d = await r.json().catch(() => ({}));
+    const pre = card.querySelector('.claudebox pre');
+    const display = d.state === 'off'
+      ? (d.available ? '(no session — press "Claude session" to start one)'
+                     : '(unavailable: ' + (d.reason || 'unknown') + ')')
+      : (d.screen || '(starting…)');
+    if (pre._shown !== display) {  // only rewrite when changed, to keep selection
+      pre._shown = display;
+      pre.textContent = display;
+    }
+    card.querySelector('.cattach').textContent =
+      d.state === 'off' ? '' : 'over SSH: ' + d.attach;
+  } finally {
+    claudeLoading.delete(name);
+  }
+}
+
+async function claudeAct(name, action) {
+  const card = cards[name];
+  claudeBusy.add(name);
+  if (action === 'start') card.querySelector('.claudebox').open = true;
+  render(last);
+  try {
+    const r = await api('api/projects/' + encodeURIComponent(name) + '/claude',
+      {method: 'POST', headers: {'Content-Type': 'application/json'},
+       body: JSON.stringify({action})});
+    const d = await r.json().catch(() => ({}));
+    showErr(r.ok ? '' : (d.error || ('claude ' + action + ' failed (' + r.status + ')')));
+  } catch (e) {
+    showErr(String(e));
+  }
+  setTimeout(() => {
+    claudeBusy.delete(name);
+    refresh();
+    if (card.querySelector('.claudebox').open) loadClaude(name, card);
+  }, 1000);
+}
+
+// --- security: passkeys + sign out -------------------------------------------
+// Shown only when the panel requires sign-in (it has a PANEL_TOKEN). A passkey
+// is tied to the address the panel is opened at and needs https, so the box
+// says why when one cannot be added here.
+function deviceName() {
+  const u = navigator.userAgent;
+  return /iPhone/.test(u) ? 'iPhone' : /iPad/.test(u) ? 'iPad'
+    : /Mac/.test(u) ? 'Mac' : /Windows/.test(u) ? 'Windows'
+    : /Android/.test(u) ? 'Android' : /Linux/.test(u) ? 'Linux' : 'this device';
+}
+
+function fmtDay(t) { return t ? new Date(t * 1000).toLocaleDateString() : 'never'; }
+
+async function loadSecurity() {
+  const r = await api('api/auth/state?origin=' + encodeURIComponent(location.origin));
+  if (!r.ok) return false;
+  const s = await r.json();
+  document.getElementById('secbtn').hidden = !s.authRequired;
+  document.getElementById('secbox').hidden = !s.authRequired;
+  if (!s.authRequired) return false;
+  const canAdd = s.passkeysSupported && !!window.PublicKeyCredential;
+  document.getElementById('pk-add').disabled = !canAdd;
+  const nameBox = document.getElementById('pk-name');
+  if (!nameBox.value) nameBox.value = deviceName();
+  document.getElementById('pkhint').textContent = !canAdd
+    ? 'Passkeys cannot be used here: ' +
+      (s.passkeysReason || 'this browser does not support them') + '.'
+    : s.passkeys
+      ? 'Passkeys sign you in at this address. Add one per device family — ' +
+        'an iPhone and a Mac share theirs through iCloud Keychain.'
+      : 'No passkey for this address yet. Add one to sign in with Face ID, ' +
+        'a fingerprint or Windows Hello instead of the token.';
+  const lr = await api('api/auth/passkeys');
+  if (!lr.ok) return canAdd;
+  const table = document.getElementById('pklist');
+  table.textContent = '';
+  for (const p of (await lr.json()).passkeys) {
+    const tr = table.insertRow();
+    const name = tr.insertCell(); name.className = 'pkname'; name.textContent = p.name;
+    tr.insertCell().textContent = p.origin === location.origin ? '' : p.origin;
+    tr.insertCell().textContent = 'added ' + fmtDay(p.created);
+    tr.insertCell().textContent = 'last used ' + fmtDay(p.lastUsed);
+    const rm = document.createElement('button');
+    rm.textContent = 'Remove';
+    rm.onclick = () => removePasskey(p.id, p.name);
+    tr.insertCell().appendChild(rm);
+  }
+  return canAdd;
+}
+
+async function addPasskey() {
+  const btn = document.getElementById('pk-add');
+  btn.disabled = true;
+  try {
+    const o = await api('api/auth/passkeys/options',
+      {method: 'POST', headers: {'Content-Type': 'application/json'},
+       body: JSON.stringify({origin: location.origin})});
+    const pub = await o.json().catch(() => ({}));
+    if (!o.ok) { showErr(pub.error || 'could not start adding a passkey'); return; }
+    pub.challenge = b64uToBuf(pub.challenge);
+    pub.user.id = b64uToBuf(pub.user.id);
+    pub.excludeCredentials = (pub.excludeCredentials || [])
+      .map(c => ({...c, id: b64uToBuf(c.id)}));
+    let cred;
+    try { cred = await navigator.credentials.create({publicKey: pub}); }
+    catch (e) { showErr('passkey not added: ' + passkeyError(e)); return; }
+    const resp = cred.response;
+    const key = resp.getPublicKey && resp.getPublicKey();
+    if (!key || !resp.getAuthenticatorData) {
+      showErr('this browser is too old to add a passkey here');
+      return;
+    }
+    const r = await api('api/auth/passkeys/register',
+      {method: 'POST', headers: {'Content-Type': 'application/json'},
+       body: JSON.stringify({
+         name: document.getElementById('pk-name').value.trim(),
+         id: bufToB64u(cred.rawId),
+         clientDataJSON: bufToB64u(resp.clientDataJSON),
+         authenticatorData: bufToB64u(resp.getAuthenticatorData()),
+         publicKey: bufToB64u(key),
+         alg: resp.getPublicKeyAlgorithm(),
+         transports: resp.getTransports ? resp.getTransports() : []})});
+    const d = await r.json().catch(() => ({}));
+    showErr(r.ok ? '' : (d.error || ('could not add the passkey (' + r.status + ')')));
+  } finally {
+    await loadSecurity();
+  }
+}
+
+async function removePasskey(id, name) {
+  if (!confirm('Remove the passkey "' + name + '"?\\n\\nIt will no longer sign ' +
+               'in to this panel. The setup token keeps working.')) return;
+  const r = await api('api/auth/passkeys/' + encodeURIComponent(id) + '/delete',
+                      {method: 'POST'});
+  const d = await r.json().catch(() => ({}));
+  showErr(r.ok ? '' : (d.error || 'could not remove the passkey'));
+  loadSecurity();
+}
+
+async function signOut(everywhere) {
+  if (everywhere && !confirm('Sign out every browser, including this one?')) return;
+  await api('api/auth/logout',
+    {method: 'POST', headers: {'Content-Type': 'application/json'},
+     body: JSON.stringify({everywhere})});
+  location.reload();
+}
+
+document.getElementById('secbtn').onclick = () => {
+  document.getElementById('secbox').open = true;
+};
+document.getElementById('secbox').addEventListener('toggle', e => {
+  if (e.target.open) loadSecurity();
+});
+document.getElementById('pk-add').onclick = addPasskey;
+document.getElementById('signout').onclick = () => signOut(false);
+document.getElementById('signout-all').onclick = () => signOut(true);
+
+// --- "New project" -----------------------------------------------------------
+// Creates/clones the folder server-side in the background; like apply, the
+// output lives in a log we poll until the run finishes.
+let createBusy = false;
+let npNameAuto = '';  // the name we last derived from the URL (safe to replace)
+
+function nameFromUrl(u) {
+  let s = u.trim();
+  while (s.endsWith('/')) s = s.slice(0, -1);
+  if (s.endsWith('.git')) s = s.slice(0, -4);
+  return s.slice(Math.max(s.lastIndexOf('/'), s.lastIndexOf(':')) + 1);
+}
+
+function setCreateBtn() {
+  const b = document.getElementById('np-create');
+  b.disabled = createBusy;
+  b.textContent = createBusy ? 'Creating…' : 'Create';
+}
+
+async function showCreate(open) {
+  const r = await api('api/create');
+  if (!r || !r.ok) return;
+  const d = await r.json();
+  const pre = document.getElementById('createlog');
+  const display = d.log || '(nothing created yet)';
+  if (pre._shown !== display) {
+    pre._shown = display; pre.textContent = display; pre.scrollTop = pre.scrollHeight;
+  }
+  const finished = createBusy && !d.creating;
+  createBusy = d.creating;
+  setCreateBtn();
+  if (open) document.getElementById('newbox').open = true;
+  if (d.creating) setTimeout(() => showCreate(false), 800);
+  else if (finished) refresh();  // show the new project's card right away
+}
+
+async function createProject() {
+  const url = document.getElementById('np-url');
+  const nm = document.getElementById('np-name');
+  createBusy = true;
+  setCreateBtn();
+  try {
+    const r = await api('api/projects',
+      {method: 'POST', headers: {'Content-Type': 'application/json'},
+       body: JSON.stringify({name: nm.value.trim(), gitUrl: url.value.trim()})});
+    const d = await r.json().catch(() => ({}));
+    showErr(r.ok ? '' : (d.error || ('create failed (' + r.status + ')')));
+    if (r.ok) { url.value = ''; nm.value = ''; npNameAuto = ''; }
+  } catch (e) {
+    showErr(String(e));
+  }
+  showCreate(true);
+}
+
+document.getElementById('newproj').onclick = () => {
+  document.getElementById('newbox').open = true;
+  document.getElementById('np-url').focus();
+};
+document.getElementById('np-create').onclick = createProject;
+document.getElementById('np-url').oninput = e => {
+  const nm = document.getElementById('np-name');
+  if (nm.value === npNameAuto) nm.value = npNameAuto = nameFromUrl(e.target.value);
+};
+document.getElementById('newbox').addEventListener('toggle', e => {
+  if (e.target.open) showCreate(false);
+});
 
 // --- per-project environment variables -------------------------------------
 // envEdit/envFileEdit hold the in-progress rows and .env path so edits survive
@@ -1135,6 +1886,15 @@ function makeCard(name) {
     '</div>' +
     '<label class="boot"><input type="checkbox" class="bootchk">' +
     '<span>Start on boot</span></label>' +
+    '<div class="claude">' +
+    '<button class="cstart">Claude session</button>' +
+    '<button class="cstop">End session</button>' +
+    '<button class="ctrust" hidden>Trust this folder</button>' +
+    '<span class="cstate"></span>' +
+    '<a class="clink" target="_blank" rel="noopener" hidden>open in claude.ai ↗</a>' +
+    '</div>' +
+    '<details class="claudebox"><summary>claude session</summary>' +
+    '<div class="cattach"></div><pre>…</pre></details>' +
     '<details class="envbox"><summary></summary><div class="env">' +
     '<div class="file"><span class="flabel">env file</span>' +
     '<input class="ef" placeholder="path to a .env file (optional)" ' +
@@ -1158,6 +1918,17 @@ function makeCard(name) {
   card.querySelector('.stop').onclick = () => act(name, 'stop');
   card.querySelector('.update').onclick = () => act(name, 'update');
   card.querySelector('.bootchk').onchange = e => setAutostart(name, card, e.target.checked);
+  card.querySelector('.cstart').onclick = () => claudeAct(name, 'start');
+  card.querySelector('.cstop').onclick = () => claudeAct(name, 'stop');
+  card.querySelector('.ctrust').onclick = e => {
+    if (confirm('Trust ' + e.target.dataset.folder + '?\\n\\n' +
+                'Claude sessions started in this folder can read, edit and ' +
+                'execute files, and the folder\\'s own Claude settings (hooks, ' +
+                'MCP servers, permission rules) will be used. Only do this for ' +
+                'a project you created or trust.')) claudeAct(name, 'trust');
+  };
+  const cbox = card.querySelector('.claudebox');
+  cbox.addEventListener('toggle', () => { if (cbox.open) loadClaude(name, card); });
 
   const env = card.querySelector('.envbox');
   env.addEventListener('toggle', () => { if (env.open) loadEnv(name, card); });
@@ -1184,7 +1955,8 @@ function updateCard(card, p) {
 
   const badge = card.querySelector('.badge');
   badge.className = 'badge ' + p.state;
-  badge.textContent = p.updating ? 'updating…' : isBusy ? 'working…' : p.state;
+  badge.textContent = p.updating ? 'updating…' : isBusy ? 'working…'
+    : p.ports.length ? p.state : 'no routes';
 
   const table = card.querySelector('table');
   const sig = p.ports.map(pt => pt.path + '@' + pt.port).join('|');
@@ -1216,6 +1988,27 @@ function updateCard(card, p) {
   setTitle(boot.parentElement, p.canLaunch
     ? 'launch this project automatically when the panel starts (written to routes.json)'
     : 'no launchScript configured');
+
+  const c = p.claude ||
+    {available: false, reason: '', state: 'off', url: '', trustFolder: ''};
+  const cBusy = claudeBusy.has(p.projectName);
+  const cStart = card.querySelector('.cstart');
+  cStart.disabled = !c.available || cBusy || !(c.state === 'off' || c.state === 'exited');
+  setTitle(cStart, c.available
+    ? 'run claude remote-control in this project, to use from claude.ai/code or the Claude app'
+    : c.reason);
+  card.querySelector('.cstop').disabled = c.state === 'off' || cBusy;
+  const cTrust = card.querySelector('.ctrust');
+  cTrust.hidden = !c.trustFolder;
+  cTrust.disabled = cBusy;
+  cTrust.dataset.folder = c.trustFolder || '';
+  const cState = card.querySelector('.cstate');
+  cState.className = 'cstate ' + c.state;
+  cState.textContent = cBusy ? 'working…' : c.state === 'off' ? ''
+    : c.state === 'waiting' ? 'waiting for an answer' : c.state;
+  const cLink = card.querySelector('.clink');
+  cLink.hidden = !c.url;
+  if (c.url) cLink.href = c.url;
 
   const envSum = card.querySelector('.envbox > summary');
   envSum.textContent = 'environment' + (p.envCount ? ' (' + p.envCount + ')' : '') +
@@ -1362,12 +2155,24 @@ function pollLogs() {
   for (const name in cards) {
     const det = cards[name].querySelector('.logbox');
     if (det && det.open) loadLog(name, cards[name]);
+    const cbox = cards[name].querySelector('.claudebox');
+    if (cbox && cbox.open) loadClaude(name, cards[name]);
   }
 }
 
 refresh();
 showApply(false);     // sync button state in case an apply is already running
 showRedeploy(false);  // and in case a redeploy is still finishing after a restart
+showCreate(false);    // and in case a project is still being created/cloned
+// Right after a token sign-in, point at "add a passkey" if one can be added.
+loadSecurity().then(canAdd => {
+  let offer = false;
+  try {
+    offer = sessionStorage.getItem('routing-panel-offer-passkey') === '1';
+    sessionStorage.removeItem('routing-panel-offer-passkey');
+  } catch (e) {}
+  if (offer && canAdd) document.getElementById('secbox').open = true;
+});
 setInterval(refresh, 3000);
 setInterval(pollLogs, 1500);
 </script>
@@ -1376,18 +2181,179 @@ setInterval(pollLogs, 1500);
 """
 
 
+# Passkey plumbing both pages need: WebAuthn speaks ArrayBuffers, JSON speaks
+# base64url. Spliced into each page's <script> where it says /*AUTH_JS*/.
+AUTH_JS = """
+function b64uToBuf(s) {
+  s = s.split('-').join('+').split('_').join('/');
+  while (s.length % 4) s += '=';
+  const bin = atob(s), a = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) a[i] = bin.charCodeAt(i);
+  return a.buffer;
+}
+
+function bufToB64u(buf) {
+  let s = '';
+  for (const b of new Uint8Array(buf)) s += String.fromCharCode(b);
+  s = btoa(s).split('+').join('-').split('/').join('_');
+  while (s.endsWith('=')) s = s.slice(0, -1);
+  return s;
+}
+
+function passkeyError(e) {
+  if (e && e.name === 'NotAllowedError') return 'it was cancelled or timed out';
+  if (e && e.name === 'InvalidStateError')
+    return 'this device already has a passkey for this panel';
+  return (e && e.message) || String(e);
+}
+"""
+
+LOGIN_PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>routing — sign in</title>
+<style>
+:root{--bg:#0f1115;--card:#181b22;--line:#262b35;--text:#e6e9ef;--dim:#8b93a3;
+      --red:#f85149;--accent:#4493f8}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:flex;align-items:center;
+     justify-content:center;padding:24px;background:var(--bg);color:var(--text);
+     font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{width:100%;max-width:380px;background:var(--card);
+     border:1px solid var(--line);border-radius:12px;padding:28px}
+h1{font-size:20px;margin:0 0 4px}
+p{margin:0 0 18px;color:var(--dim);font-size:13px}
+button{font:inherit;font-size:14px;padding:9px 14px;border-radius:7px;
+       border:1px solid var(--line);background:#212630;color:var(--text);
+       cursor:pointer}
+button:hover:enabled{border-color:var(--accent)}
+button:disabled{opacity:.5;cursor:default}
+#pk{width:100%;border-color:var(--accent);margin-bottom:14px}
+details{font-size:13px}
+summary{color:var(--dim);cursor:pointer;user-select:none}
+form{display:flex;gap:8px;margin:10px 0 8px}
+input{font:inherit;font-size:13px;flex:1;min-width:0;padding:8px 10px;
+      border-radius:7px;border:1px solid var(--line);background:#0b0d11;
+      color:var(--text)}
+input:focus{outline:none;border-color:var(--accent)}
+.note{font-size:12px;margin:0}
+#err{color:var(--red);font-size:13px;min-height:20px;margin-top:12px}
+</style>
+</head>
+<body>
+<main>
+<h1>routing panel</h1>
+<p>Sign in to manage this host's projects.</p>
+<button id="pk" hidden>Sign in with a passkey</button>
+<details id="tok"><summary>Use the setup token</summary>
+<form id="tokform">
+<input type="text" autocomplete="username" value="routing-panel" hidden>
+<input id="token" type="password" autocomplete="current-password" placeholder="PANEL_TOKEN" spellcheck="false" autocapitalize="off">
+<button id="tokbtn">Sign in</button>
+</form>
+<p class="note" id="toknote"></p>
+</details>
+<div id="err"></div>
+</main>
+<script>
+/*AUTH_JS*/
+const $ = id => document.getElementById(id);
+const err = m => { $('err').textContent = m || ''; };
+
+async function post(path, body) {
+  const r = await fetch(path, {method: 'POST',
+    headers: {'Content-Type': 'application/json', 'X-Panel-CSRF': '1'},
+    body: JSON.stringify(body || {})});
+  return {ok: r.ok, d: await r.json().catch(() => ({}))};
+}
+
+async function init() {
+  let s = {};
+  try {
+    const r = await fetch('api/auth/state?origin=' + encodeURIComponent(location.origin));
+    s = await r.json();
+  } catch (e) {}
+  const usable = !!s.passkeysSupported && !!window.PublicKeyCredential;
+  const ready = usable && s.passkeys > 0;
+  $('pk').hidden = !ready;
+  $('tok').open = !ready;
+  $('toknote').textContent = ready
+    ? 'The token also works, e.g. on a device that has no passkey yet.'
+    : usable
+      ? 'No passkey is set up for this address yet. Sign in with the token, ' +
+        'then add one under Security.'
+      : 'Passkeys cannot be used here' +
+        (s.passkeysReason ? ': ' + s.passkeysReason : '') + '.';
+}
+
+$('pk').onclick = async () => {
+  err('');
+  $('pk').disabled = true;
+  try {
+    const o = await post('api/auth/passkey/options', {origin: location.origin});
+    if (!o.ok) { err(o.d.error || 'could not start passkey sign-in'); return; }
+    const pub = o.d;
+    pub.challenge = b64uToBuf(pub.challenge);
+    pub.allowCredentials = pub.allowCredentials.map(c => ({...c, id: b64uToBuf(c.id)}));
+    let cred;
+    try { cred = await navigator.credentials.get({publicKey: pub}); }
+    catch (e) { err('Passkey sign-in did not finish: ' + passkeyError(e)); return; }
+    const resp = cred.response;
+    const v = await post('api/auth/passkey/verify', {
+      id: bufToB64u(cred.rawId),
+      clientDataJSON: bufToB64u(resp.clientDataJSON),
+      authenticatorData: bufToB64u(resp.authenticatorData),
+      signature: bufToB64u(resp.signature)});
+    if (!v.ok) { err(v.d.error || 'passkey sign-in failed'); return; }
+    location.reload();
+  } finally {
+    $('pk').disabled = false;
+  }
+};
+
+$('tokform').onsubmit = async e => {
+  e.preventDefault();
+  err('');
+  $('tokbtn').disabled = true;
+  try {
+    const v = await post('api/auth/login', {token: $('token').value});
+    if (!v.ok) { err(v.d.error || 'sign-in failed'); return; }
+    // the dashboard uses this to point at "add a passkey" once
+    try { sessionStorage.setItem('routing-panel-offer-passkey', '1'); } catch (e) {}
+    location.reload();
+  } finally {
+    $('tokbtn').disabled = false;
+  }
+};
+
+init();
+</script>
+</body>
+</html>
+"""
+
+PAGE = PAGE.replace("/*AUTH_JS*/", AUTH_JS)
+LOGIN_PAGE = LOGIN_PAGE.replace("/*AUTH_JS*/", AUTH_JS)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "routing-panel"
 
     def log_message(self, fmt, *args):
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
 
-    def _send(self, code, body, ctype="application/json"):
+    def _send(self, code, body, ctype="application/json", headers=()):
         data = body if isinstance(body, bytes) else json.dumps(body).encode()
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Frame-Options", "DENY")  # never inside another site
+        self.send_header("Referrer-Policy", "same-origin")
+        for name, value in headers:
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(data)
 
@@ -1402,8 +2368,97 @@ class Handler(BaseHTTPRequestHandler):
             path = path[len(PANEL_PATH):]
         return path
 
-    def _authed(self):
-        return not TOKEN or self.headers.get("X-Panel-Token") == TOKEN
+    def _cookie(self):
+        """Our session cookie's value. Parsed by hand: other apps on this
+        hostname set cookies too, and a strict parser chokes on some of them."""
+        for part in self.headers.get("Cookie", "").split(";"):
+            name, _, value = part.strip().partition("=")
+            if name == COOKIE_NAME:
+                return value
+        return ""
+
+    def _auth_via(self):
+        """How this request is authorised: "open" (the panel has no token),
+        "token" (X-Panel-Token header), "cookie" (signed-in browser) or ""."""
+        if not TOKEN:
+            return "open"
+        given = self.headers.get("X-Panel-Token")
+        if given is not None:
+            try:
+                if check_token(given):
+                    return "token"
+            except panel_auth.AuthError:
+                pass  # token use is paused; a session cookie may still do
+        if auth.session_valid(self._cookie()):
+            return "cookie"
+        return ""
+
+    def _session_cookie(self, value, max_age):
+        secure = ("; Secure"
+                  if self.headers.get("Origin", "").startswith("https://") else "")
+        # Lax, not Strict, so a link or bookmark into the panel arrives signed
+        # in; every state-changing request is a POST that must also carry the
+        # X-Panel-CSRF header, which another site cannot send.
+        return ("Set-Cookie", f"{COOKIE_NAME}={value}; Path={PANEL_PATH}; "
+                              f"Max-Age={max_age}; HttpOnly; SameSite=Lax{secure}")
+
+    def _start_session(self, how):
+        value, max_age = auth.new_session(how)
+        return self._send(200, {"ok": True},
+                          headers=[self._session_cookie(value, max_age)])
+
+    def _auth_route(self, path, method, via):
+        if method == "GET" and path == "/api/auth/state":
+            origin = parse_qs(urlparse(self.path).query).get("origin", [""])[0]
+            try:
+                origin, _ = panel_auth.normalize_origin(origin)
+                reason = ""
+            except panel_auth.AuthError as e:  # e.g. opened over plain http
+                origin, reason = None, str(e)
+            ok, missing = auth.passkeys_available()
+            return self._send(200, {
+                "authRequired": bool(TOKEN),
+                "authenticated": bool(via),
+                "passkeysSupported": bool(TOKEN) and ok and origin is not None,
+                "passkeysReason": missing or reason,
+                "passkeys": auth.passkey_count(origin) if origin else 0,
+            })
+        if not TOKEN:
+            raise PanelError(400, "sign-in is not enabled: the panel has no "
+                                  "PANEL_TOKEN")
+        body = self._json_body() if method == "POST" else {}
+        if not isinstance(body, dict):
+            raise PanelError(400, "request body must be a JSON object")
+        if method == "POST" and path == "/api/auth/login":
+            if not check_token(body.get("token")):
+                raise PanelError(401, "that is not this panel's token")
+            return self._start_session("token")
+        if method == "POST" and path == "/api/auth/passkey/options":
+            return self._send(200, auth.login_options(body.get("origin")))
+        if method == "POST" and path == "/api/auth/passkey/verify":
+            return self._start_session("passkey: " + auth.login_verify(body))
+
+        # everything below manages sign-in, so it needs a signed-in user
+        if not via:
+            return self._send(401, {"error": "not signed in"})
+        if method == "GET" and path == "/api/auth/passkeys":
+            return self._send(200, {"passkeys": auth.list_passkeys()})
+        if method == "POST" and path == "/api/auth/passkeys/options":
+            return self._send(200, auth.register_options(body.get("origin")))
+        if method == "POST" and path == "/api/auth/passkeys/register":
+            return self._send(200, {"ok": True, "name": auth.register(body)})
+        m = re.fullmatch(r"/api/auth/passkeys/([A-Za-z0-9_-]+)/delete", path)
+        if method == "POST" and m:
+            auth.delete_passkey(m.group(1))
+            return self._send(200, {"ok": True})
+        if method == "POST" and path == "/api/auth/logout":
+            if body.get("everywhere") is True:
+                auth.end_all_sessions()
+            else:
+                auth.end_session(self._cookie())
+            return self._send(200, {"ok": True},
+                              headers=[self._session_cookie("", 0)])
+        self._send(404, {"error": "not found"})
 
     def _json_body(self):
         try:
@@ -1419,11 +2474,30 @@ class Handler(BaseHTTPRequestHandler):
             raise PanelError(400, "request body must be valid JSON")
 
     def _dispatch(self, path, method):
-        if not self._authed():
-            return self._send(401, {"error": "missing or bad X-Panel-Token"})
+        via = self._auth_via()
         try:
+            # A browser sends our cookie along with requests that other sites
+            # make it issue; only our own page can add this header to them.
+            if (method == "POST" and via not in ("open", "token")
+                    and self.headers.get("X-Panel-CSRF") != "1"):
+                raise PanelError(403, "missing X-Panel-CSRF header")
+            if path.startswith("/api/auth/"):
+                return self._auth_route(path, method, via)
+            if not via:
+                return self._send(401, {"error": "not signed in (browsers: "
+                                                 "reload to sign in; scripts: "
+                                                 "send X-Panel-Token)"})
             if method == "GET" and path == "/api/projects":
                 return self._send(200, project_status())
+            if method == "POST" and path == "/api/projects":
+                body = self._json_body()
+                return self._send(200, create_project(body.get("name", ""),
+                                                      body.get("gitUrl", "")))
+            if method == "GET" and path == "/api/create":
+                with lock:
+                    running = creating
+                return self._send(200, {"creating": running,
+                                        "log": create_tail()})
             if path == "/api/apply":
                 if method == "POST":
                     return self._send(200, apply_routes())
@@ -1439,9 +2513,24 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, {"redeploying": redeploy_running(),
                                             "log": redeploy_tail()})
             m = re.fullmatch(
-                r"/api/projects/([^/]+)/(log|env|autostart|start|stop|update)", path)
+                r"/api/projects/([^/]+)/(log|env|autostart|start|stop|update|claude)",
+                path)
             if m:
                 name, action = unquote(m.group(1)), m.group(2)
+                if action == "claude":
+                    project = find_project(name)  # 404 for unknown names
+                    if method == "GET":
+                        return self._send(200, claude_info(project))
+                    if method == "POST":
+                        what = self._json_body().get("action")
+                        if what == "start":
+                            return self._send(200, claude_start(project))
+                        if what == "stop":
+                            return self._send(200, claude_stop(project))
+                        if what == "trust":
+                            return self._send(200, claude_trust(project))
+                        raise PanelError(400, "\"action\" must be \"start\", "
+                                              "\"stop\" or \"trust\"")
                 if method == "GET" and action == "log":
                     find_project(name)  # 404 for unknown names
                     full = parse_qs(urlparse(self.path).query).get(
@@ -1471,7 +2560,7 @@ class Handler(BaseHTTPRequestHandler):
                 if method == "POST" and action == "update":
                     return self._send(200, update_project(find_project(name)))
             self._send(404, {"error": "not found"})
-        except PanelError as e:
+        except (PanelError, panel_auth.AuthError) as e:
             self._send(e.code, {"error": str(e)})
         except Exception as e:  # bad routes.json, etc.
             self._send(500, {"error": f"{type(e).__name__}: {e}"})
@@ -1481,7 +2570,10 @@ class Handler(BaseHTTPRequestHandler):
         if path is None:
             return
         if path in ("/", "/index.html"):
-            return self._send(200, PAGE.encode(), "text/html; charset=utf-8")
+            # 200 either way: the sign-in page is what an unauthenticated
+            # browser gets here (and what redeploy.sh's health check sees)
+            page = PAGE if self._auth_via() else LOGIN_PAGE
+            return self._send(200, page.encode(), "text/html; charset=utf-8")
         if path == "/favicon.ico":
             return self._send(404, b"", "text/plain")
         self._dispatch(path, "GET")

@@ -6,7 +6,9 @@
 # Env: PANEL_PORT (default 8090), PANEL_TOKEN (optional — recommended
 #      if the proxy is exposed publicly via Tailscale Funnel),
 #      INSTANCE_NAME (default "default" — names the unit + default path),
-#      PANEL_PATH (default /$INSTANCE_NAME), PROXY_PORT, ADMIN_PORT.
+#      PANEL_PATH (default /$INSTANCE_NAME), PROXY_PORT, ADMIN_PORT,
+#      and optionally PROJECTS_ROOT, CLAUDE_BIN, CLAUDE_PERMISSION_MODE,
+#      CLAUDE_MAX_SESSIONS, PANEL_SESSION_DAYS (see scripts/panel.py).
 
 set -euo pipefail
 
@@ -42,6 +44,15 @@ else
   warn "  PANEL_TOKEN=<secret> scripts/install-panel.sh"
 fi
 
+# Optional panel settings ("New project" + Claude sessions): written into the
+# unit only when set, so the panel's own defaults apply otherwise.
+EXTRA_LINES=""
+for var in PROJECTS_ROOT CLAUDE_BIN CLAUDE_PERMISSION_MODE CLAUDE_MAX_SESSIONS PANEL_SESSION_DAYS; do
+  if [[ -n "${!var:-}" ]]; then
+    EXTRA_LINES+="Environment=${var}=${!var}"$'\n'
+  fi
+done
+
 say "Writing ${UNIT} (sudo)"
 # All generator-affecting vars are put in the unit env because the panel's
 # "Apply routes" button runs apply.sh inheriting this environment — without
@@ -60,7 +71,7 @@ Environment=PANEL_PATH=${PANEL_PATH}
 Environment=PROXY_PORT=${PROXY_PORT}
 Environment=ADMIN_PORT=${ADMIN_PORT}
 ${TOKEN_LINE}
-ExecStart=/usr/bin/python3 ${ROOT}/scripts/panel.py
+${EXTRA_LINES}ExecStart=/usr/bin/python3 ${ROOT}/scripts/panel.py
 Restart=on-failure
 RestartSec=2
 

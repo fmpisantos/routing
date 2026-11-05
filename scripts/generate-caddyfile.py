@@ -18,7 +18,8 @@ Each path entry forwards requests matching `path` to 127.0.0.1:<port>.
 A path ending in "/*" also covers the bare prefix: "/flowlet" is
 308-redirected to "/flowlet/", so a trailing slash is never required
 (and backends that only serve the slashed path still work). The
-redirect is skipped if an explicit "/flowlet" route exists.
+redirect is skipped if an explicit "/flowlet" route exists. "paths" may
+be empty or omitted for a project that has nothing to route yet.
 
 "launchScript", "appPath" and "launchOnStart" are not used here — they
 are read by scripts/panel.py, the control panel served at /default that
@@ -114,9 +115,11 @@ def load_routes(config_path, panel_path):
         if not isinstance(project.get("launchOnStart", False), bool):
             fail(f"{where}: \"launchOnStart\" must be true or false")
 
-        paths = project.get("paths")
-        if not isinstance(paths, list) or not paths:
-            fail(f"{where}: \"paths\" must be a non-empty array")
+        # "paths" may be empty or omitted: a project the panel created (or one
+        # that only needs a Claude session) has nothing to route yet.
+        paths = project.get("paths", [])
+        if not isinstance(paths, list):
+            fail(f"{where}: \"paths\" must be an array")
 
         for j, route in enumerate(paths):
             rwhere = f"{where}, path #{j + 1}"
