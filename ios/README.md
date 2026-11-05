@@ -8,9 +8,13 @@ This folder is the hand-off from the Pi (where Swift cannot be compiled) to a Ma
 side is finished; the app is still to be written. Everything needed is here or in the code this
 file points at.
 
+**To build it:** on the Mac, open Claude Code in this repository and say
+"Follow ios/MAC_RUNBOOK.md". The runbook goes from an empty folder to a build in TestFlight.
+
 | Here | What |
 |---|---|
-| `README.md` | this spec |
+| `README.md` | this spec: what the app does and how it talks to the panel |
+| `MAC_RUNBOOK.md` | the order of work, the checks, signing and the TestFlight release |
 | `Fixtures/*.json` | sanitised sample responses for model decoding tests and SwiftUI previews |
 | `Fixtures/attestation-vector.json` | test vector for the passkey enrolment parser |
 | `tools/attestation_reference.py` | reference implementation of that parser, proven against the server |
@@ -147,17 +151,21 @@ ios/
   project.yml                 XcodeGen project (the .xcodeproj is generated, not committed)
   Config.example.xcconfig     copy to Config.xcconfig (gitignored): DEVELOPMENT_TEAM,
                               PRODUCT_BUNDLE_IDENTIFIER, PANEL_HOST
-  RoutingPanel/
+  PanelKit/                   local Swift package: everything that is not a screen
+    Sources/PanelKit/         Models, PanelClient, PanelError, SetCookie, SessionStore,
+                              Profile, ProfileStore, Base64URL, AttestationParser
+    Tests/PanelKitTests/      fixture decoding, AttestationParser, Set-Cookie, URL building
+  RoutingPanel/               the app target (SwiftUI)
     App/        RoutingPanelApp, AppModel (profiles + active session)
-    Profiles/   Profile, ProfileStore (UserDefaults), KeychainStore, ProfileMenu, ProfileEditor
-    API/        PanelClient, Models, PanelError
-    Auth/       SignInView, PasskeyCoordinator, AttestationParser, Base64URL, SecurityView
+    Profiles/   KeychainStore, ProfileMenu, ProfileEditor
+    Auth/       SignInView, PasskeyCoordinator, SecurityView
     Features/   ProjectsView, ProjectDetailView, EnvEditorView, LogView, ClaudeSection,
                 TerminalView, JobLogSheet, NewProjectSheet
     Support/    Poller
     RoutingPanel.entitlements  (webcredentials:$(PANEL_HOST))
-  RoutingPanelTests/           AttestationParser, model decoding, Set-Cookie parsing
 ```
+
+The package holds the logic so it can be tested on the Mac with `swift test`, without a simulator.
 
 **Profiles.** `Profile { id, name, baseURL, tint }` in UserDefaults; the active one is remembered.
 A menu in the top bar of the home screen lists the profiles with a checkmark and a "Manage
@@ -201,12 +209,13 @@ sign-in, offer "Add a passkey for this profile". Show the server's message for 4
 brew install xcodegen
 cd ios
 cp Config.example.xcconfig Config.xcconfig   # fill in team, bundle id, panel host
+(cd PanelKit && swift test)
 xcodegen
-xcodebuild -scheme RoutingPanel -destination 'platform=iOS Simulator,name=iPhone 16' test
 open RoutingPanel.xcodeproj
 ```
 
-The bundle ID and Team ID must match the entry in the Pi's `app-association.json`.
+The bundle ID and Team ID must match the entry in the Pi's `app-association.json`. Signing,
+running on a phone and the TestFlight upload are in [`MAC_RUNBOOK.md`](MAC_RUNBOOK.md).
 
 ## 6. Test checklist (real iPhone, once per profile)
 

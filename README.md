@@ -231,8 +231,10 @@ Things to know:
 
 `ios/` holds the spec for a native iPhone app that drives the panel through
 the same API as the web page, with one **profile** per instance (`default`,
-`bruno`, …) and a passkey for each. The app is built on a Mac; see
-[`ios/README.md`](ios/README.md).
+`bruno`, …) and a passkey for each. The app is built on a Mac:
+[`ios/README.md`](ios/README.md) is the spec and
+[`ios/MAC_RUNBOOK.md`](ios/MAC_RUNBOOK.md) is the step-by-step brief to hand
+to Claude Code there, up to a TestFlight build.
 
 For the app to use this hostname's passkeys, the hostname has to name the
 app in Apple's site-association file. Copy `app-association.example.json` to
