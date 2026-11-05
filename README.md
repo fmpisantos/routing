@@ -266,8 +266,12 @@ on this host.
   not restarted automatically.
 - Sessions survive a panel restart or redeploy: they run in tmux on a
   dedicated tmux server that the panel starts as its own transient systemd
-  unit (`routing-claude-<instance>`) via `sudo -n systemd-run`. This needs
-  the same passwordless `systemd-run` rule as **Restart panel** above.
+  unit (`routing-claude-<instance>`). That takes one of two things:
+  - **lingering** for the panel's user — `sudo loginctl enable-linger <user>`,
+    once. The unit then runs under the user's own systemd manager and no
+    sudo is involved. Used whenever it is enabled.
+  - otherwise the same passwordless `systemd-run` rule as **Restart panel**
+    above (`sudo -n systemd-run`).
 - At most `CLAUDE_MAX_SESSIONS` (default 4) run at once. By default Claude
   asks you to approve actions in the app; set `CLAUDE_PERMISSION_MODE`
   (e.g. `acceptEdits`) to change that for every session. Both, and

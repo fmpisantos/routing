@@ -112,6 +112,7 @@ Env:
 import hmac
 import json
 import os
+import pwd
 import re
 import shlex
 import shutil
@@ -1116,6 +1117,11 @@ def _claude_session_url(env_url):
             continue
         if not isinstance(data, dict) or data.get("environmentId") != env.group(1):
             continue
+        # claude leaves the pointer behind when it exits and gets the same
+        # environment id next time, so only believe a live process's pointer
+        if not (isinstance(data.get("pid"), int)
+                and Path(f"/proc/{data['pid']}").exists()):
+            continue
         sid = CLAUDE_SESSION_ID_RE.match(str(data.get("sessionId") or ""))
         # claude.ai links use the session_ spelling of the id
         return f"https://claude.ai/code/session_{sid.group(1)}" if sid else ""
@@ -1232,6 +1238,21 @@ def claude_info(project):
             "attach": f"tmux -L {CLAUDE_SOCKET} attach -t {session}"}
 
 
+def _user_manager_ready():
+    """Can this user's own systemd manager keep the tmux server running?
+
+    Only with lingering enabled (`sudo loginctl enable-linger <user>`): without
+    it the manager, and everything it runs, stops when the user's last login
+    ends.
+    """
+    try:
+        user = pwd.getpwuid(os.getuid()).pw_name
+    except KeyError:
+        return False
+    return (Path(f"/var/lib/systemd/linger/{user}").exists()
+            and Path(f"/run/user/{os.getuid()}/bus").exists())
+
+
 def claude_start(project):
     name = project["projectName"]
     require_token("starting Claude sessions")
@@ -1264,18 +1285,27 @@ def claude_start(project):
             # keep the pane after claude exits so a failure stays readable
             ";", "set-option", "-w", "-t", session, "remain-on-exit", "on",
         ]
+        env = None
         if _tmux("list-sessions").returncode != 0:  # no server yet: own unit
-            tmux_cmd = [
-                "sudo", "-n", "systemd-run", "--collect", "--quiet",
+            unit = [
+                "--collect", "--quiet",
                 f"--unit={CLAUDE_UNIT}", "--service-type=forking",
-                f"--uid={os.getuid()}", f"--gid={os.getgid()}",
                 f"--working-directory={Path.home()}",
                 f"--setenv=HOME={Path.home()}",
                 f"--setenv=PATH={os.environ.get('PATH') or '/usr/local/bin:/usr/bin:/bin'}",
                 "--setenv=LANG=C.UTF-8",
-            ] + tmux_cmd
+            ]
+            if _user_manager_ready():
+                # the user's own systemd manager: needs no sudo at all
+                env = {**os.environ,
+                       "XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}"}
+                tmux_cmd = ["systemd-run", "--user"] + unit + tmux_cmd
+            else:
+                # a transient system unit: needs passwordless sudo
+                tmux_cmd = ["sudo", "-n", "systemd-run", f"--uid={os.getuid()}",
+                            f"--gid={os.getgid()}"] + unit + tmux_cmd
         try:
-            r = subprocess.run(tmux_cmd, stdin=subprocess.DEVNULL,
+            r = subprocess.run(tmux_cmd, stdin=subprocess.DEVNULL, env=env,
                                capture_output=True, timeout=30,
                                encoding="utf-8", errors="replace")
         except (OSError, subprocess.TimeoutExpired) as e:
@@ -1284,8 +1314,15 @@ def claude_start(project):
             claude_sessions(fresh=True)  # drop the cached "no session" answer
         if r.returncode != 0:
             detail = (r.stderr or r.stdout).strip().splitlines()
+            hint = ""
+            if tmux_cmd[0] == "sudo" and any("sudo:" in l for l in detail):
+                hint = (" — this user has no passwordless sudo for systemd-run;"
+                        " run `sudo loginctl enable-linger "
+                        f"{pwd.getpwuid(os.getuid()).pw_name}` once so sessions"
+                        " can run without sudo (see the README)")
             raise PanelError(500, "could not start a Claude session: "
-                             + (detail[-1] if detail else f"exit {r.returncode}"))
+                             + (detail[-1] if detail else f"exit {r.returncode}")
+                             + hint)
     return {"ok": True, "session": session}
 
 
