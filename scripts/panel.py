@@ -1048,6 +1048,8 @@ def create_tail(max_bytes=65536):
 # question it is waiting on), and lets you attach over SSH. Like a redeploy,
 # the tmux server must not be our child — systemd would kill it with us on a
 # panel restart — so it is started as its own transient unit via `systemd-run`.
+# Claude runs through the user's login shell (`$SHELL -lc`), so it gets the
+# variables exported in that shell's login files, as a normal terminal does.
 CLAUDE_BIN = (os.environ.get("CLAUDE_BIN") or shutil.which("claude")
               or str(Path.home() / ".local" / "bin" / "claude"))
 CLAUDE_PERMISSION_MODE = os.environ.get("CLAUDE_PERMISSION_MODE", "").strip()
@@ -1253,6 +1255,20 @@ def _user_manager_ready():
             and Path(f"/run/user/{os.getuid()}/bus").exists())
 
 
+def _login_shell():
+    """The user's own login shell, so claude gets the same exports as a terminal.
+
+    The tmux server starts from systemd with a near-empty environment, so the
+    variables have to come from the shell's login files (for zsh: .zshenv and
+    .zprofile under ZDOTDIR); a hard-coded bash would skip zsh's entirely.
+    """
+    try:
+        shell = pwd.getpwuid(os.getuid()).pw_shell
+    except KeyError:
+        shell = ""
+    return shell if shell and os.access(shell, os.X_OK) else "/bin/bash"
+
+
 def claude_start(project):
     name = project["projectName"]
     require_token("starting Claude sessions")
@@ -1281,7 +1297,7 @@ def claude_start(project):
         tmux_cmd = [
             "tmux", "-u", "-L", CLAUDE_SOCKET,
             "new-session", "-d", "-s", session, "-x", "200", "-y", "50",
-            "-c", app_path, "bash", "-lc", inner,
+            "-c", app_path, _login_shell(), "-lc", inner,
             # keep the pane after claude exits so a failure stays readable
             ";", "set-option", "-w", "-t", session, "remain-on-exit", "on",
         ]

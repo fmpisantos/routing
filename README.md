@@ -289,6 +289,11 @@ on this host.
   It is asked once per folder. Think before trusting a repository you
   cloned: its own Claude settings (hooks, MCP servers) apply to sessions
   there.
+- Claude starts through your login shell (`$SHELL -lc`, e.g. zsh reads
+  `.zshenv` and `.zprofile`), so it sees the same exported variables as a
+  normal terminal. Put exports there, not in an interactive-only file such
+  as `.zshrc`. A running session keeps the environment it started with: end
+  and restart it after changing them.
 - **End session** stops it. Sessions also end when the host reboots; they are
   not restarted automatically.
 - Sessions survive a panel restart or redeploy: they run in tmux on a
