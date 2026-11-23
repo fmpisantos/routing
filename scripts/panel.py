@@ -1297,7 +1297,11 @@ def claude_start(project):
         tmux_cmd = [
             "tmux", "-u", "-L", CLAUDE_SOCKET,
             "new-session", "-d", "-s", session, "-x", "200", "-y", "50",
-            "-c", app_path, _login_shell(), "-lc", inner,
+            "-c", app_path,
+            # oh-my-zsh, loaded from a login file, would otherwise stop on its
+            # "Would you like to update? [Y/n]" before claude ever starts
+            "-e", "DISABLE_AUTO_UPDATE=true",
+            _login_shell(), "-lc", inner,
             # keep the pane after claude exits so a failure stays readable
             ";", "set-option", "-w", "-t", session, "remain-on-exit", "on",
         ]
